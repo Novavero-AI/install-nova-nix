@@ -8,6 +8,17 @@ it on `PATH`. No Haskell toolchain, nothing to build, nothing to configure.
 - run: nova-nix eval --expr '1 + 2'
 ```
 
+Evaluation stops at weak head normal form, so a scalar prints as itself while a
+list or attrset prints its elements as thunks. `--strict` forces them:
+
+```console
+$ nova-nix eval --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
+[ <thunk> <thunk> <thunk> <thunk> <thunk> ]
+
+$ nova-nix eval --strict --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
+[ 1 4 9 16 25 ]
+```
+
 Pin a version rather than tracking the newest release:
 
 ```yaml
