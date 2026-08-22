@@ -1,13 +1,18 @@
-# install-nova-nix
+<div align="center">
+<h1>install-nova-nix</h1>
+<p><strong>Install nova-nix in a GitHub Actions workflow.</strong></p>
+<p>Downloads a released archive, verifies it against the published checksums, and adds it to <code>PATH</code>. No Haskell toolchain required.</p>
 
 [![Test](https://github.com/Novavero-AI/install-nova-nix/actions/workflows/test.yml/badge.svg)](https://github.com/Novavero-AI/install-nova-nix/actions/workflows/test.yml)
+[![Version](https://img.shields.io/github/v/tag/Novavero-AI/install-nova-nix?label=version&color=purple)](https://github.com/Novavero-AI/install-nova-nix/tags)
+![License](https://img.shields.io/badge/license-Apache--2.0-blue)
 
-Install [nova-nix](https://github.com/Novavero-AI/nova-nix) in a GitHub Actions
-workflow. Downloads a released archive, verifies it against the published
-checksums, and adds it to `PATH`. No Haskell toolchain required.
+</div>
 
-For what to do with it once installed, see
-[nova-nix's README](https://github.com/Novavero-AI/nova-nix#readme).
+---
+
+For what to do with nova-nix once installed, see
+[its README](https://github.com/Novavero-AI/nova-nix#readme).
 
 ## Usage
 
