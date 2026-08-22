@@ -68,9 +68,9 @@ fails the step instead of landing on `PATH`.
 
 ## Evaluating
 
-Worth knowing the first time output looks wrong: evaluation stops at weak head
-normal form, so a scalar prints as itself while a list or attrset prints
-elements that have not been forced. `--strict` forces them.
+Evaluation stops at weak head normal form. A scalar prints as itself, but a
+list or attr set prints only as far as its elements have been forced, which is
+not far. `--strict` forces the whole result.
 
 ```console
 $ nova-nix eval --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
