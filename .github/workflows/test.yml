@@ -68,6 +68,46 @@ jobs:
           $got = nova-nix eval --expr '1 + 2'
           if ($got -ne '3') { Write-Error "expected 3, got $got"; exit 1 }
 
+  # Installing and evaluating is not the same as building, and building is
+  # most of what someone installs this to do.  The archive carries share/ so
+  # <nix/*> resolves and pkgs/ so there is something to build; nothing proved
+  # the two work together from a downloaded release until here.  Substituted
+  # rather than compiled: the toolchain takes twenty minutes to build from
+  # source and what is under test is the installed nova-nix, not MinGW.
+  build:
+    name: Build a package with it
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: Novavero-AI/install-nova-nix@v1
+        id: nova
+
+      - name: Build hello from the bundled recipes
+        shell: bash
+        env:
+          BIN: ${{ steps.nova.outputs.bin-dir }}
+        run: |
+          set -euo pipefail
+          out=$(nova-nix build "$BIN/../pkgs/windows/hello.nix" \
+            --substituter https://cache.novavero.ai \
+            --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ= \
+            | tail -n1)
+          echo "built: $out"
+          [ -n "$out" ] || { echo "no store path on stdout" >&2; exit 1; }
+          echo "out=$out" >> "$GITHUB_ENV"
+
+      - name: The built program runs
+        shell: pwsh
+        run: |
+          $hello = Join-Path $env:out "hello.exe"
+          if (-not (Test-Path $hello)) { Write-Error "no hello.exe in $env:out"; exit 1 }
+          $got = (& $hello) -join "`n"
+          Write-Host "output: $got"
+          if ($got -ne "Hello from the first native Windows Nix build.") {
+            Write-Error "unexpected output: $got"; exit 1
+          }
+
   pinned:
     name: Install a pinned version
     runs-on: ubuntu-latest
