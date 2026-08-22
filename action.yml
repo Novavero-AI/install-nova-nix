@@ -1,0 +1,129 @@
+name: Install nova-nix
+description: Install a released nova-nix and put it on PATH. No toolchain required.
+author: Novavero AI Inc.
+
+branding:
+  icon: package
+  color: purple
+
+inputs:
+  version:
+    description: >-
+      The version to install, with or without a leading v (for example 0.7.0.0),
+      or "latest" for the most recent release.
+    required: false
+    default: latest
+
+outputs:
+  bin-dir:
+    description: The directory added to PATH, holding the nova-nix executable.
+    value: ${{ steps.install.outputs.bin-dir }}
+  archive:
+    description: The name of the release asset that was installed.
+    value: ${{ steps.install.outputs.archive }}
+
+runs:
+  using: composite
+  steps:
+    - id: install
+      shell: bash
+      # Inputs reach the script through the environment rather than a ${{ }}
+      # splice: a splice is substituted into the source text before bash sees
+      # it, so a version string containing shell syntax would run as shell.
+      env:
+        INPUT_VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+
+        repo=Novavero-AI/nova-nix
+
+        case "${RUNNER_OS}" in
+          Linux)   platform=linux;   ext=tar.gz ;;
+          macOS)   platform=macos;   ext=tar.gz ;;
+          Windows) platform=windows; ext=zip ;;
+          *) echo "::error::unsupported runner OS: ${RUNNER_OS}"; exit 1 ;;
+        esac
+
+        case "${RUNNER_ARCH}" in
+          X64)   arch=x64 ;;
+          ARM64) arch=arm64 ;;
+          *) echo "::error::unsupported runner architecture: ${RUNNER_ARCH}"; exit 1 ;;
+        esac
+
+        # The release builds one archive per platform on the runner image
+        # GitHub calls latest for it, so exactly these three exist.  Naming
+        # the gap is the point: an unsupported runner otherwise fails on a
+        # 404 from the asset URL, which reads as a broken release.
+        case "${platform}-${arch}" in
+          linux-x64|macos-arm64|windows-x64) ;;
+          *)
+            echo "::error::nova-nix publishes no archive for ${platform}-${arch}"
+            exit 1
+            ;;
+        esac
+
+        stem="nova-nix-${platform}-${arch}"
+        archive="${stem}.${ext}"
+
+        if [ "${INPUT_VERSION}" = latest ]; then
+          base="https://github.com/${repo}/releases/latest/download"
+        else
+          base="https://github.com/${repo}/releases/download/v${INPUT_VERSION#v}"
+        fi
+
+        # Under RUNNER_TEMP rather than mktemp -d: on Windows this script runs
+        # in MSYS bash while curl and 7z are native programs, and an MSYS
+        # temp path is not one they can open.  RUNNER_TEMP is a native path
+        # on every runner.
+        work="${RUNNER_TEMP}/nova-nix-download"
+        rm -rf "${work}"
+        mkdir -p "${work}"
+        for file in "${archive}" SHA256SUMS; do
+          curl --fail --silent --show-error --location \
+               --retry 3 --retry-connrefused \
+               --output "${work}/${file}" "${base}/${file}"
+        done
+
+        # sha256sum is absent on macOS and shasum on some minimal Linux
+        # images, so the one that exists is used rather than either assumed.
+        if command -v sha256sum >/dev/null 2>&1; then
+          verify() { sha256sum -c "$1"; }
+        elif command -v shasum >/dev/null 2>&1; then
+          verify() { shasum -a 256 -c "$1"; }
+        else
+          echo "::error::no sha256sum or shasum to verify the download with"
+          exit 1
+        fi
+
+        # SHA256SUMS covers every asset in the release and -c fails on the
+        # lines whose files are absent, so the one line that matters is
+        # selected first.  By string equality, not a pattern: an asset name
+        # is full of dots, and a regex would let them match anything.
+        cd "${work}"
+        awk -v want="${archive}" '{ name = $2; sub(/^\*/, "", name); if (name == want) print }' \
+          SHA256SUMS > "${archive}.sha256"
+        if [ ! -s "${archive}.sha256" ]; then
+          echo "::error::SHA256SUMS carries no line for ${archive}"
+          exit 1
+        fi
+        verify "${archive}.sha256"
+
+        dest="${RUNNER_TEMP}/nova-nix"
+        rm -rf "${dest}"
+        mkdir -p "${dest}"
+        if [ "${ext}" = zip ]; then
+          # Git for Windows ships no unzip; 7z is on the runner image.
+          7z x -bso0 -bsp0 -o"${dest}" "${work}/${archive}"
+        else
+          tar -xzf "${work}/${archive}" -C "${dest}"
+        fi
+
+        root="${dest}/${stem}"
+        if [ ! -d "${root}/bin" ]; then
+          echo "::error::${archive} did not unpack to ${stem}/bin"
+          exit 1
+        fi
+
+        echo "${root}/bin" >> "${GITHUB_PATH}"
+        echo "bin-dir=${root}/bin" >> "${GITHUB_OUTPUT}"
+        echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
