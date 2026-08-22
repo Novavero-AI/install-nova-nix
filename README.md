@@ -106,4 +106,5 @@ substituted archive fails the step rather than landing on `PATH`.
 
 ## License
 
-[Apache-2.0](LICENSE)
+[Apache-2.0](LICENSE). Copyright 2026 Novavero AI Inc. and contributors, see
+[NOTICE](NOTICE).
