@@ -6,6 +6,9 @@ Install [nova-nix](https://github.com/Novavero-AI/nova-nix) in a GitHub Actions
 workflow. Downloads a released archive, verifies it against the published
 checksums, and adds it to `PATH`. No Haskell toolchain required.
 
+For what to do with it once installed, see
+[nova-nix's README](https://github.com/Novavero-AI/nova-nix#readme).
+
 ## Usage
 
 ```yaml
@@ -67,17 +70,6 @@ nothing checked out. They target Windows:
     BIN: ${{ steps.nova.outputs.bin-dir }}
 ```
 
-### Substitute from a binary cache
-
-```yaml
-- uses: Novavero-AI/install-nova-nix@v1
-- run: |
-    nova-nix build FILE.nix \
-      --substituter https://cache.novavero.ai \
-      --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
-  shell: bash
-```
-
 ## Platform support
 
 | Runner | Archive |
@@ -111,20 +103,6 @@ under `RUNNER_TEMP`, and appends `bin/` to `GITHUB_PATH`.
 
 Verification happens before anything is unpacked, so a truncated transfer or a
 substituted archive fails the step rather than landing on `PATH`.
-
-## Notes
-
-nova-nix evaluates to weak head normal form. A scalar prints as itself, but a
-list or attribute set prints only as far as its elements have been forced.
-`--strict` forces the whole result.
-
-```console
-$ nova-nix eval --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
-[ <thunk> <thunk> <thunk> <thunk> <thunk> ]
-
-$ nova-nix eval --strict --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
-[ 1 4 9 16 25 ]
-```
 
 ## License
 
