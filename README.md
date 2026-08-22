@@ -1,7 +1,12 @@
 # install-nova-nix
 
-Install a released [nova-nix](https://github.com/Novavero-AI/nova-nix) and put
-it on `PATH`. No Haskell toolchain, nothing to build, nothing to configure.
+[![Test](https://github.com/Novavero-AI/install-nova-nix/actions/workflows/test.yml/badge.svg)](https://github.com/Novavero-AI/install-nova-nix/actions/workflows/test.yml)
+
+Install [nova-nix](https://github.com/Novavero-AI/nova-nix) in a GitHub Actions
+workflow. Downloads a released archive, verifies it against the published
+checksums, and adds it to `PATH`. No Haskell toolchain required.
+
+## Usage
 
 ```yaml
 steps:
@@ -9,15 +14,71 @@ steps:
   - run: nova-nix eval --expr '1 + 2'
 ```
 
-Track the newest release, or pin one:
+## Inputs
+
+| Name | Description | Required | Default |
+| --- | --- | --- | --- |
+| `version` | Version to install, with or without a leading `v` (for example `0.7.0.0`). `latest` installs the most recent release. | No | `latest` |
+
+## Outputs
+
+| Name | Description |
+| --- | --- |
+| `bin-dir` | Directory added to `PATH`, containing the `nova-nix` executable. |
+| `archive` | Name of the release asset that was installed. |
+
+## Examples
+
+### Pin a version
 
 ```yaml
-  - uses: Novavero-AI/install-nova-nix@v1
-    with:
-      version: 0.7.0.0
+- uses: Novavero-AI/install-nova-nix@v1
+  with:
+    version: 0.7.0.0
 ```
 
-## Runners
+### Every platform
+
+```yaml
+jobs:
+  evaluate:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: Novavero-AI/install-nova-nix@v1
+      - run: nova-nix eval --strict --expr 'builtins.map (x: x * x) [ 1 2 3 ]'
+        shell: bash
+```
+
+### Build a package
+
+The archive ships the package recipes beside the executable, so a build needs
+nothing checked out. They target Windows:
+
+```yaml
+- uses: Novavero-AI/install-nova-nix@v1
+  id: nova
+- run: nova-nix build "$BIN/../pkgs/windows/hello.nix"
+  shell: bash
+  env:
+    BIN: ${{ steps.nova.outputs.bin-dir }}
+```
+
+### Substitute from a binary cache
+
+```yaml
+- uses: Novavero-AI/install-nova-nix@v1
+- run: |
+    nova-nix build FILE.nix \
+      --substituter https://cache.novavero.ai \
+      --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
+  shell: bash
+```
+
+## Platform support
 
 | Runner | Archive |
 | --- | --- |
@@ -26,51 +87,36 @@ Track the newest release, or pin one:
 | `windows-latest` | `nova-nix-windows-x64.zip` |
 
 nova-nix publishes one archive per platform, built on the runner image GitHub
-calls latest for it, so those three are what exists. Any other combination
-fails with the platform named, rather than as a download that happens to 404.
+calls latest for it, so those three are what exists. Any other runner fails
+with the platform named rather than as a download that happens to 404.
 
-## Inputs and outputs
-
-| Input | Default | |
-| --- | --- | --- |
-| `version` | `latest` | The version to install, with or without a leading `v`. |
-
-| Output | |
-| --- | --- |
-| `bin-dir` | The directory added to `PATH`, holding the executable. |
-| `archive` | The release asset that was installed. |
-
-## What lands on the runner
+## What it installs
 
 The archive unpacks to `bin/` beside `share/` and `pkgs/`, and only `bin/`
 goes on `PATH`.
 
-`share/` is how the `<nix/*>` search path resolves with nothing configured,
-which is the difference between an installed nova-nix that can build and one
-that can only evaluate. `pkgs/` carries the package recipes, so the build
-from nova-nix's own README runs against what this action installed. They
-target Windows, so this one wants `windows-latest`:
+- `bin/` - the `nova-nix` executable, statically linked against everything but
+  the Windows system libraries.
+- `share/` - the bundled `<nix/*>` search path, resolved relative to the
+  executable, which is what lets an installed nova-nix build rather than only
+  evaluate.
+- `pkgs/` - the package recipes, reachable at `${{ steps.<id>.outputs.bin-dir }}/../pkgs`.
 
-```yaml
-  - uses: Novavero-AI/install-nova-nix@v1
-    id: nova
-  - run: nova-nix build "$BIN/../pkgs/windows/hello.nix"
-    shell: bash
-    env:
-      BIN: ${{ steps.nova.outputs.bin-dir }}
-```
+## How it works
 
-## Verification
+A composite action: the steps run directly in your job, on your runner, with no
+Node bundle to build or audit. It resolves the platform, downloads the matching
+archive and the release's `SHA256SUMS`, verifies the archive against it, unpacks
+under `RUNNER_TEMP`, and appends `bin/` to `GITHUB_PATH`.
 
-Every download is checked against the `SHA256SUMS` published with the release
-before anything is unpacked, so a truncated transfer or a substituted archive
-fails the step instead of landing on `PATH`.
+Verification happens before anything is unpacked, so a truncated transfer or a
+substituted archive fails the step rather than landing on `PATH`.
 
-## Evaluating
+## Notes
 
-Evaluation stops at weak head normal form. A scalar prints as itself, but a
-list or attr set prints only as far as its elements have been forced, which is
-not far. `--strict` forces the whole result.
+nova-nix evaluates to weak head normal form. A scalar prints as itself, but a
+list or attribute set prints only as far as its elements have been forced.
+`--strict` forces the whole result.
 
 ```console
 $ nova-nix eval --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
@@ -80,6 +126,6 @@ $ nova-nix eval --strict --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
 [ 1 4 9 16 25 ]
 ```
 
-## Licence
+## License
 
-Apache-2.0, the same as nova-nix. See [LICENSE](LICENSE).
+[Apache-2.0](LICENSE)
