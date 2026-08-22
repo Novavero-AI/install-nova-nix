@@ -78,11 +78,35 @@ runs:
         work="${RUNNER_TEMP}/nova-nix-download"
         rm -rf "${work}"
         mkdir -p "${work}"
-        for file in "${archive}" SHA256SUMS; do
-          curl --fail --silent --show-error --location \
-               --retry 3 --retry-connrefused \
-               --output "${work}/${file}" "${base}/${file}"
-        done
+
+        # --fail turns an HTTP error into exit 22, which reaches the log as a
+        # bare "curl: (22) ... 404" and says nothing about what is missing.
+        # The status is captured instead, so the two ways a download 404s can
+        # be told apart and named: no release under that URL at all, or a
+        # release that exists without this platform's asset on it.
+        fetch() {
+          file=$1
+          status=$(curl --silent --show-error --location \
+                        --retry 3 --retry-connrefused \
+                        --write-out '%{http_code}' \
+                        --output "${work}/${file}" "${base}/${file}") || status=000
+          if [ "${status}" = 200 ]; then
+            return 0
+          fi
+          if [ "${status}" = 404 ]; then
+            if [ "${INPUT_VERSION}" = latest ]; then
+              echo "::error::${repo} has published no release with ${file} on it yet. Releases are cut by tagging; until the first one exists there is nothing for this action to install."
+            else
+              echo "::error::${repo} has no release v${INPUT_VERSION#v} carrying ${file}. Check the version against the releases page, and that this platform's archive was attached to it."
+            fi
+          else
+            echo "::error::downloading ${base}/${file} failed with HTTP ${status}."
+          fi
+          return 1
+        }
+
+        fetch "${archive}" || exit 1
+        fetch SHA256SUMS || exit 1
 
         # sha256sum is absent on macOS and shasum on some minimal Linux
         # images, so the one that exists is used rather than either assumed.

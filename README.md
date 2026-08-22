@@ -4,58 +4,20 @@ Install a released [nova-nix](https://github.com/Novavero-AI/nova-nix) and put
 it on `PATH`. No Haskell toolchain, nothing to build, nothing to configure.
 
 ```yaml
-- uses: Novavero-AI/install-nova-nix@v1
-- run: nova-nix eval --expr '1 + 2'
+steps:
+  - uses: Novavero-AI/install-nova-nix@v1
+  - run: nova-nix eval --expr '1 + 2'
 ```
 
-Evaluation stops at weak head normal form, so a scalar prints as itself while a
-list or attrset prints its elements as thunks. `--strict` forces them:
-
-```console
-$ nova-nix eval --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
-[ <thunk> <thunk> <thunk> <thunk> <thunk> ]
-
-$ nova-nix eval --strict --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
-[ 1 4 9 16 25 ]
-```
-
-Pin a version rather than tracking the newest release:
+Track the newest release, or pin one:
 
 ```yaml
-- uses: Novavero-AI/install-nova-nix@v1
-  with:
-    version: 0.7.0.0
+  - uses: Novavero-AI/install-nova-nix@v1
+    with:
+      version: 0.7.0.0
 ```
 
-## Inputs
-
-| Input | Default | Description |
-| --- | --- | --- |
-| `version` | `latest` | The version to install, with or without a leading `v`. `latest` tracks the most recent release. |
-
-## Outputs
-
-| Output | Description |
-| --- | --- |
-| `bin-dir` | The directory added to `PATH`, holding the executable. |
-| `archive` | The release asset that was installed. |
-
-## What lands on the runner
-
-The release archive unpacks to `bin/` beside `share/` and `pkgs/`, and only
-`bin/` goes on `PATH`. `share/` is how `<nix/*>` resolves without anything set,
-so an installed nova-nix can build and not only evaluate. `pkgs/` carries the
-Windows recipes, reachable at `${{ steps.<id>.outputs.bin-dir }}/../pkgs`:
-
-```yaml
-- uses: Novavero-AI/install-nova-nix@v1
-  id: nova
-- run: nova-nix build "${BIN}/../pkgs/windows/hello.nix"
-  env:
-    BIN: ${{ steps.nova.outputs.bin-dir }}
-```
-
-## Supported runners
+## Runners
 
 | Runner | Archive |
 | --- | --- |
@@ -64,14 +26,59 @@ Windows recipes, reachable at `${{ steps.<id>.outputs.bin-dir }}/../pkgs`:
 | `windows-latest` | `nova-nix-windows-x64.zip` |
 
 nova-nix publishes one archive per platform, built on the runner image GitHub
-calls latest for it, so those three are what exists. Anything else fails with
-the combination named rather than with a 404 that reads as a broken release.
+calls latest for it, so those three are what exists. Any other combination
+fails with the platform named, rather than as a download that happens to 404.
+
+## Inputs and outputs
+
+| Input | Default | |
+| --- | --- | --- |
+| `version` | `latest` | The version to install, with or without a leading `v`. |
+
+| Output | |
+| --- | --- |
+| `bin-dir` | The directory added to `PATH`, holding the executable. |
+| `archive` | The release asset that was installed. |
+
+## What lands on the runner
+
+The archive unpacks to `bin/` beside `share/` and `pkgs/`, and only `bin/`
+goes on `PATH`.
+
+`share/` is how the `<nix/*>` search path resolves with nothing configured,
+which is the difference between an installed nova-nix that can build and one
+that can only evaluate. `pkgs/` carries the package recipes, so the build
+from nova-nix's own README runs against what this action installed. They
+target Windows, so this one wants `windows-latest`:
+
+```yaml
+  - uses: Novavero-AI/install-nova-nix@v1
+    id: nova
+  - run: nova-nix build "$BIN/../pkgs/windows/hello.nix"
+    shell: bash
+    env:
+      BIN: ${{ steps.nova.outputs.bin-dir }}
+```
 
 ## Verification
 
 Every download is checked against the `SHA256SUMS` published with the release
-before it is unpacked, so a truncated transfer or a substituted archive fails
-the step instead of landing on `PATH`.
+before anything is unpacked, so a truncated transfer or a substituted archive
+fails the step instead of landing on `PATH`.
+
+## Evaluating
+
+Worth knowing the first time output looks wrong: evaluation stops at weak head
+normal form, so a scalar prints as itself while a list or attrset prints
+elements that have not been forced. `--strict` forces them.
+
+```console
+$ nova-nix eval --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
+[ <thunk> <thunk> <thunk> <thunk> <thunk> ]
+
+$ nova-nix eval --strict --expr 'builtins.map (x: x * x) [ 1 2 3 4 5 ]'
+[ 1 4 9 16 25 ]
+```
 
 ## Licence
 
