@@ -71,9 +71,9 @@ jobs:
   # Installing and evaluating is not the same as building, and building is
   # most of what someone installs this to do.  The archive carries share/ so
   # <nix/*> resolves and pkgs/ so there is something to build; nothing proved
-  # the two work together from a downloaded release until here.  Substituted
-  # rather than compiled: the toolchain takes twenty minutes to build from
-  # source and what is under test is the installed nova-nix, not MinGW.
+  # the two work together from a downloaded release until here.  The public
+  # cache can avoid rebuilding the toolchain, but a successful build alone
+  # does not prove substitution: nova-nix can fall back to compiling locally.
   build:
     name: Build a package with it
     runs-on: windows-latest
@@ -99,13 +99,26 @@ jobs:
 
       - name: The built program runs
         shell: pwsh
+        env:
+          LC_ALL: C
         run: |
-          $hello = Join-Path $env:out "hello.exe"
-          if (-not (Test-Path $hello)) { Write-Error "no hello.exe in $env:out"; exit 1 }
+          # New releases build GNU Hello through stdenv; 0.7.0.0 shipped a
+          # small demo installed at the output root. Check each layout's
+          # exact output while latest still transitions between the two.
+          $hello = Join-Path $env:out "bin/hello.exe"
+          $expected = "Hello, world!"
+          if (-not (Test-Path -PathType Leaf $hello)) {
+            $hello = Join-Path $env:out "hello.exe"
+            $expected = "Hello from the first native Windows Nix build."
+          }
+          if (-not (Test-Path -PathType Leaf $hello)) {
+            Write-Error "no bin/hello.exe or hello.exe in $env:out"; exit 1
+          }
           $got = (& $hello) -join "`n"
+          if ($LASTEXITCODE -ne 0) { Write-Error "hello failed with exit code $LASTEXITCODE"; exit 1 }
           Write-Host "output: $got"
-          if ($got -ne "Hello from the first native Windows Nix build.") {
-            Write-Error "unexpected output: $got"; exit 1
+          if ($got -cne $expected) {
+            Write-Error "expected '$expected', got '$got'"; exit 1
           }
 
   pinned:
