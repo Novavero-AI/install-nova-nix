@@ -1,17 +1,15 @@
-<div align="center">
-<h1>install-nova-nix</h1>
-<p><strong>Install nova-nix in a GitHub Actions workflow.</strong></p>
-<p>Downloads a released archive, verifies it against the published checksums, and adds it to <code>PATH</code>. No Haskell toolchain required.</p>
+# install-nova-nix
 
 [![Test](https://github.com/Novavero-AI/install-nova-nix/actions/workflows/test.yml/badge.svg)](https://github.com/Novavero-AI/install-nova-nix/actions/workflows/test.yml)
 [![Version](https://img.shields.io/github/v/tag/Novavero-AI/install-nova-nix?label=version&color=purple)](https://github.com/Novavero-AI/install-nova-nix/tags)
-![License](https://img.shields.io/badge/license-Apache--2.0-blue)
+[![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-</div>
+Install [nova-nix](https://github.com/Novavero-AI/nova-nix) in a GitHub Actions
+workflow. The action downloads a release archive, checks it against the
+release's published checksums, and adds it to `PATH`. No Haskell toolchain is
+needed.
 
----
-
-For what to do with nova-nix once installed, see
+For what to do with nova-nix once it is installed, see
 [its README](https://github.com/Novavero-AI/nova-nix#readme).
 
 ## Usage
@@ -57,22 +55,28 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: Novavero-AI/install-nova-nix@v1
-      - run: nova-nix eval --strict --expr 'builtins.map (x: x * x) [ 1 2 3 ]'
+      - run: |
+          nova-nix eval --strict --expr 'builtins.map (x: x * x) [ 1 2 3 ]'
         shell: bash
 ```
 
 ### Build a package
 
 The archive ships the package recipes beside the executable, so a build needs
-nothing checked out. They target Windows:
+nothing checked out. The recipes target Windows, so the job runs on a Windows
+runner:
 
 ```yaml
-- uses: Novavero-AI/install-nova-nix@v1
-  id: nova
-- run: nova-nix build "$BIN/../pkgs/windows/hello.nix"
-  shell: bash
-  env:
-    BIN: ${{ steps.nova.outputs.bin-dir }}
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: Novavero-AI/install-nova-nix@v1
+        id: nova
+      - run: nova-nix build "$BIN/../pkgs/windows/hello.nix"
+        shell: bash
+        env:
+          BIN: ${{ steps.nova.outputs.bin-dir }}
 ```
 
 ## Platform support
@@ -85,29 +89,34 @@ nothing checked out. They target Windows:
 
 nova-nix publishes one archive per platform, built on the runner image GitHub
 calls latest for it, so those three are what exists. Any other runner fails
-with the platform named rather than as a download that happens to 404.
+with the platform named, rather than as a download that happens to 404.
 
 ## What it installs
 
-The archive unpacks to `bin/` beside `share/` and `pkgs/`, and only `bin/`
-goes on `PATH`.
+The archive unpacks to a single directory holding `bin/`, `share/` and
+`pkgs/`, and only `bin/` goes on `PATH`.
 
-- `bin/` - the `nova-nix` executable, statically linked against everything but
-  the Windows system libraries.
-- `share/` - the bundled `<nix/*>` search path, resolved relative to the
+- `bin/`: the `nova-nix` executable. The Windows build needs only the Windows
+  system DLLs. The Linux build loads glibc, libm, zlib and GMP dynamically, and
+  the macOS build loads system libraries from `/usr/lib`. This repository's
+  tests run the executable on all three hosted runners.
+- `share/`: the bundled `<nix/*>` search path, resolved relative to the
   executable, which is what lets an installed nova-nix build rather than only
   evaluate.
-- `pkgs/` - the package recipes, reachable at `${{ steps.<id>.outputs.bin-dir }}/../pkgs`.
+- `pkgs/`: the package recipes, reachable at
+  `${{ steps.<id>.outputs.bin-dir }}/../pkgs`.
 
 ## How it works
 
 A composite action: the steps run directly in your job, on your runner, with no
 Node bundle to build or audit. It resolves the platform, downloads the matching
-archive and the release's `SHA256SUMS`, verifies the archive against it, unpacks
-under `RUNNER_TEMP`, and appends `bin/` to `GITHUB_PATH`.
+archive and the release's `SHA256SUMS`, verifies the archive against it,
+unpacks it under `RUNNER_TEMP`, and appends `bin/` to `GITHUB_PATH`.
 
-Verification happens before anything is unpacked, so a truncated transfer or a
-substituted archive fails the step rather than landing on `PATH`.
+Verification happens before anything is unpacked, so a truncated or corrupted
+download, or an archive that does not match its release's checksum, fails the
+step before anything reaches `PATH`. The checksums come from the same release
+as the archive, so this shows the download is intact, not who published it.
 
 ## License
 
