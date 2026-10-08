@@ -24,7 +24,7 @@ steps:
 
 | Name | Description | Required | Default |
 | --- | --- | --- | --- |
-| `version` | Version to install, with or without a leading `v` (for example `0.7.0.0`). `latest` installs the most recent release. | No | `latest` |
+| `version` | Version to install, with or without a leading `v` (for example `0.8.0.0`). `latest` installs the most recent release. | No | `latest` |
 
 ## Outputs
 
@@ -40,7 +40,7 @@ steps:
 ```yaml
 - uses: Novavero-AI/install-nova-nix@v1
   with:
-    version: 0.7.0.0
+    version: 0.8.0.0
 ```
 
 ### Every platform
