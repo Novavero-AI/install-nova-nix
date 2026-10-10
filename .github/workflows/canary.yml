@@ -1,0 +1,21 @@
+name: Canary
+
+# Nothing here has to change for this action to break: it installs what
+# nova-nix releases, on runner images that move under it, so a change to the
+# asset names, the archive layout, the checksum file, the recipe paths or the
+# runner breaks it from outside this repository.  A file of its own because
+# GitHub disables a scheduled workflow in a public repository after 60 days
+# without activity, the whole workflow and not only its schedule: in test.yml
+# that would also stop the push and pull request runs, and the required
+# checks with them.
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    uses: ./.github/workflows/test.yml
