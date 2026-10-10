@@ -4,20 +4,47 @@ on:
   push:
     branches: [main]
   pull_request:
+  # A version given by hand tests that release as a workflow pinning it
+  # installs it, rather than whatever is latest.
   workflow_dispatch:
-  # Nothing here has to change for this action to break: it installs
-  # whatever nova-nix released last, so a change to the asset names, the
-  # archive layout, or the checksum file breaks it from the other repository.
-  # Without a schedule that is discovered by whoever runs it next.
-  schedule:
-    - cron: '0 6 * * 1'
+    inputs:
+      version:
+        description: The nova-nix release to test, for example 0.8.0.0, or latest.
+        type: string
+        default: latest
+  # canary.yml calls this weekly.
+  workflow_call:
 
 permissions:
   contents: read
 
 jobs:
-  latest:
-    name: Install latest (${{ matrix.os }})
+  # The version input is free text, and the action splices it into its
+  # download URL, where a slash or a dot-dot would point it at another
+  # repository's release.  So it is checked once, before anything installs it.
+  version:
+    name: Version under test
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.check.outputs.version }}
+    steps:
+      - id: check
+        shell: bash
+        env:
+          VERSION: ${{ inputs.version || 'latest' }}
+        run: |
+          set -euo pipefail
+          release='^v?[0-9]+(\.[0-9]+)*$'
+          # Not echoed: a line of unchecked text can read as a workflow command.
+          if [ "${VERSION}" != latest ] && [[ ! "${VERSION}" =~ ${release} ]]; then
+            echo "::error::version must name a release, such as 0.8.0.0, or be latest"
+            exit 1
+          fi
+          echo "version=${VERSION#v}" >> "${GITHUB_OUTPUT}"
+
+  install:
+    name: Install ${{ needs.version.outputs.version }} (${{ matrix.os }})
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -28,6 +55,8 @@ jobs:
 
       - uses: ./
         id: nova
+        with:
+          version: ${{ needs.version.outputs.version }}
 
       # Separate steps on purpose: a PATH entry written to GITHUB_PATH takes
       # effect only in the steps after the one that wrote it, so running the
@@ -78,12 +107,15 @@ jobs:
   # so a gap costs this job minutes, and nova-nix's CI is where it turns red.
   build:
     name: Build a package with it
+    needs: version
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
 
       - uses: ./
         id: nova
+        with:
+          version: ${{ needs.version.outputs.version }}
 
       - name: Build hello from the bundled recipes
         shell: bash
