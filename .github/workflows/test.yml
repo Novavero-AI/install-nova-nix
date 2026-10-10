@@ -71,16 +71,18 @@ jobs:
   # Installing and evaluating is not the same as building, and building is
   # most of what someone installs this to do.  The archive carries share/ so
   # <nix/*> resolves and pkgs/ so there is something to build; nothing proved
-  # the two work together from a downloaded release until here.  The public
-  # cache can avoid rebuilding the toolchain, but a successful build alone
-  # does not prove substitution: nova-nix can fall back to compiling locally.
+  # the two work together from a downloaded release until here.  The toolchain
+  # substitutes from the public cache: nova-nix publishes its Windows closure
+  # from every push to main, and fails that run if a fresh store would build
+  # any of it.  Not asserted here: nova-nix builds whatever the cache lacks,
+  # so a gap costs this job minutes, and nova-nix's CI is where it turns red.
   build:
     name: Build a package with it
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v6
 
-      - uses: Novavero-AI/install-nova-nix@v1
+      - uses: ./
         id: nova
 
       - name: Build hello from the bundled recipes
