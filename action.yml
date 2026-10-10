@@ -37,6 +37,16 @@ runs:
 
         repo=Novavero-AI/nova-nix
 
+        # The version becomes a path segment of the download URL, and curl
+        # removes dot segments before the request, so a slash or a dot-dot in
+        # it would fetch another repository's release and SHA256SUMS with it.
+        # Not echoed: a line of unchecked text can read as a workflow command.
+        release='^v?[0-9]+(\.[0-9]+)*$'
+        if [ "${INPUT_VERSION}" != latest ] && [[ ! "${INPUT_VERSION}" =~ ${release} ]]; then
+          echo "::error::version must name a release, such as 0.8.0.0, or be latest"
+          exit 1
+        fi
+
         case "${RUNNER_OS}" in
           Linux)   platform=linux;   ext=tar.gz ;;
           macOS)   platform=macos;   ext=tar.gz ;;

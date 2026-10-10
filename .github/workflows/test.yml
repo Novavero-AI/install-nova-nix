@@ -141,3 +141,26 @@ jobs:
           set -euo pipefail
           got=$(nova-nix eval --expr '1 + 2')
           [ "$got" = 3 ] || { echo "expected 3, got $got" >&2; exit 1; }
+
+  refused:
+    name: Refuse a version that is not a release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      # A dot-dot that curl would resolve to another repository's release.
+      - uses: ./
+        id: nova
+        continue-on-error: true
+        with:
+          version: 0/../../../../../octocat/Hello-World/releases/download/v1
+
+      - name: The action refused it before downloading
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.nova.outcome }}
+          BIN_DIR: ${{ steps.nova.outputs.bin-dir }}
+        run: |
+          set -euo pipefail
+          [ "$OUTCOME" = failure ] || { echo "expected failure, got $OUTCOME" >&2; exit 1; }
+          [ -z "$BIN_DIR" ] || { echo "installed into $BIN_DIR" >&2; exit 1; }
