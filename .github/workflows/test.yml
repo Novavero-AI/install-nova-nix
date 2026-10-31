@@ -51,7 +51,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: ./
         id: nova
@@ -110,7 +110,7 @@ jobs:
     needs: version
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - uses: ./
         id: nova
@@ -159,7 +159,7 @@ jobs:
     name: Install a pinned version
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # The pinned path builds a different URL from the latest path, so it is
       # not covered by the matrix above.
@@ -178,7 +178,7 @@ jobs:
     name: Refuse a version that is not a release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       # A dot-dot that curl would resolve to another repository's release.
       - uses: ./
