@@ -11,6 +11,7 @@ name: Canary
 on:
   schedule:
     - cron: '0 6 * * 1'
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -19,3 +20,21 @@ jobs:
   test:
     name: Test
     uses: ./.github/workflows/test.yml
+
+  # Users run the v1 tag, which moves by hand, and test.yml runs the action as
+  # checked out, so a change to action.yml reaches nobody until v1 moves and
+  # no job there can see that it has not.
+  tag:
+    name: v1 carries main's action
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: action.yml matches v1
+        run: |
+          if ! git diff --exit-code refs/tags/v1 HEAD -- action.yml; then
+            echo "::error::action.yml on main differs from v1, so users do not have this change. Move v1 to main."
+            exit 1
+          fi
