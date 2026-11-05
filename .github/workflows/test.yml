@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: The nova-nix release to test, for example 0.8.0.0, or latest.
+        description: The nova-nix release to test, for example 0.10.0.0, or latest.
         type: string
         default: latest
   # canary.yml calls this weekly.
@@ -37,7 +37,7 @@ jobs:
           release='^v?[0-9]+(\.[0-9]+)*$'
           # Not echoed: a line of unchecked text can read as a workflow command.
           if [ "${VERSION}" != latest ] && [[ ! "${VERSION}" =~ ${release} ]]; then
-            echo "::error::version must name a release, such as 0.8.0.0, or be latest"
+            echo "::error::version must name a release, such as 0.10.0.0, or be latest"
             exit 1
           fi
           echo "version=${VERSION#v}" >> "${GITHUB_OUTPUT}"
@@ -136,9 +136,9 @@ jobs:
         env:
           LC_ALL: C
         run: |
-          # New releases build GNU Hello through stdenv; 0.7.0.0 shipped a
-          # small demo installed at the output root. Check each layout's
-          # exact output while latest still transitions between the two.
+          # Current releases build GNU Hello through stdenv into bin/; 0.7.0.0
+          # shipped a small demo at the output root, and the second branch
+          # keeps a hand-dispatched run of that release passing.
           $hello = Join-Path $env:out "bin/hello.exe"
           $expected = "Hello, world!"
           if (-not (Test-Path -PathType Leaf $hello)) {

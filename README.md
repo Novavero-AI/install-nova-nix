@@ -24,7 +24,7 @@ steps:
 
 | Name | Description | Required | Default |
 | --- | --- | --- | --- |
-| `version` | Version to install, with or without a leading `v` (for example `0.9.0.0`). `latest` installs the most recent release. | No | `latest` |
+| `version` | Version to install, with or without a leading `v` (for example `0.10.0.0`). `latest` installs the most recent release. | No | `latest` |
 
 ## Outputs
 
@@ -40,7 +40,7 @@ steps:
 ```yaml
 - uses: Novavero-AI/install-nova-nix@v1
   with:
-    version: 0.9.0.0
+    version: 0.10.0.0
 ```
 
 ### Every platform
@@ -64,7 +64,9 @@ jobs:
 
 The archive ships the package recipes beside the executable, so a build needs
 nothing checked out. The recipes target Windows, so the job runs on a Windows
-runner:
+runner. The public cache holds the closure nova-nix's main branch last built,
+so naming it downloads what it holds and builds only what it lacks; without it
+the build compiles the toolchain seeds first.
 
 ```yaml
 jobs:
@@ -73,7 +75,10 @@ jobs:
     steps:
       - uses: Novavero-AI/install-nova-nix@v1
         id: nova
-      - run: nova-nix build "$BIN/../pkgs/windows/hello.nix"
+      - run: >-
+          nova-nix build "$BIN/../pkgs/windows/hello.nix"
+          --substituter https://cache.novavero.ai
+          --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ=
         shell: bash
         env:
           BIN: ${{ steps.nova.outputs.bin-dir }}
@@ -88,18 +93,20 @@ jobs:
 | `windows-latest` | `nova-nix-windows-x64.zip` |
 
 nova-nix publishes one archive per platform, built on the runner image GitHub
-calls latest for it, so those three are what exists. Any other runner fails
-with the platform named, rather than as a download that happens to 404.
+calls latest for it, so those three are all that exist. On any other runner
+the action fails with an error naming the platform, rather than with a 404 from
+the download.
 
 ## What it installs
 
-The archive unpacks to a single directory holding `bin/`, `share/` and
-`pkgs/`, and only `bin/` goes on `PATH`.
+The archive unpacks to a single directory holding `bin/`, `share/`, `pkgs/` and
+nova-nix's LICENSE, NOTICE and README.md, and only `bin/` goes on `PATH`.
 
 - `bin/`: the `nova-nix` executable. The Windows build needs only the Windows
   system DLLs. The Linux build loads glibc, libm, zlib and GMP dynamically, and
-  the macOS build loads system libraries from `/usr/lib`. This repository's
-  tests run the executable on all three hosted runners.
+  the macOS build loads only libraries macOS ships, from `/usr/lib` and
+  `/System/Library/Frameworks`. This repository's tests run the executable on
+  all three hosted runners.
 - `share/`: the bundled `<nix/*>` search path, resolved relative to the
   executable, which is what lets an installed nova-nix build rather than only
   evaluate.
@@ -117,8 +124,10 @@ Verification happens before anything is unpacked, so a truncated or corrupted
 download, or an archive that does not match its release's checksum, fails the
 step before anything reaches `PATH`. The checksums come from the same release
 as the archive, so this shows the download is intact, not who published it.
+With `latest`, a release published between the two downloads fails the check;
+pin `version` for a reproducible install.
 
 ## License
 
-[Apache-2.0](LICENSE). Copyright 2026 Novavero AI Inc. and contributors, see
+[Apache-2.0](LICENSE). Copyright 2026 Novavero AI Inc. and contributors; see
 [NOTICE](NOTICE).

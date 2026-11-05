@@ -9,7 +9,7 @@ branding:
 inputs:
   version:
     description: >-
-      The version to install, with or without a leading v (for example 0.7.0.0),
+      The version to install, with or without a leading v (for example 0.10.0.0),
       or "latest" for the most recent release.
     required: false
     default: latest
@@ -43,7 +43,7 @@ runs:
         # Not echoed: a line of unchecked text can read as a workflow command.
         release='^v?[0-9]+(\.[0-9]+)*$'
         if [ "${INPUT_VERSION}" != latest ] && [[ ! "${INPUT_VERSION}" =~ ${release} ]]; then
-          echo "::error::version must name a release, such as 0.8.0.0, or be latest"
+          echo "::error::version must name a release, such as 0.10.0.0, or be latest"
           exit 1
         fi
 
@@ -105,7 +105,7 @@ runs:
           fi
           if [ "${status}" = 404 ]; then
             if [ "${INPUT_VERSION}" = latest ]; then
-              echo "::error::${repo} has published no release with ${file} on it yet. Releases are cut by tagging; until the first one exists there is nothing for this action to install."
+              echo "::error::the latest ${repo} release carries no ${file}."
             else
               echo "::error::${repo} has no release v${INPUT_VERSION#v} carrying ${file}. Check the version against the releases page, and that this platform's archive was attached to it."
             fi
