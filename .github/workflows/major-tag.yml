@@ -1,0 +1,32 @@
+name: Major tag
+
+# Users run Novavero-AI/install-nova-nix@v1, the convention for an action:
+# the major tag follows the newest release of its major version, so a fix
+# reaches them with nothing to change on their side, and a breaking change
+# waits for v2.  Pushing a release tag, vMAJOR.MINOR.PATCH, moves the major
+# tag to the same commit here, so a release cannot leave it behind.
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: write
+
+jobs:
+  move:
+    name: Move the major tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Point the major tag at the release
+        env:
+          RELEASE: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          major=${RELEASE%%.*}
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag --force --annotate "${major}" \
+            --message "install-nova-nix ${major} (currently ${RELEASE#v})" HEAD
+          git push --force origin "refs/tags/${major}"
