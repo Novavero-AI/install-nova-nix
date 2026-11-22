@@ -27,11 +27,13 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.check.outputs.version }}
+      release: ${{ steps.check.outputs.release }}
     steps:
       - id: check
         shell: bash
         env:
           VERSION: ${{ inputs.version || 'latest' }}
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           release='^v?[0-9]+(\.[0-9]+)*$'
@@ -41,6 +43,14 @@ jobs:
             exit 1
           fi
           echo "version=${VERSION#v}" >> "${GITHUB_OUTPUT}"
+          # The release number, latest resolved, which the installer jobs
+          # check the nova-nix they installed against.
+          if [ "${VERSION}" = latest ]; then
+            tag=$(gh release view --repo Novavero-AI/nova-nix --json tagName --jq .tagName)
+          else
+            tag=${VERSION}
+          fi
+          echo "release=${tag#v}" >> "${GITHUB_OUTPUT}"
 
   install:
     name: Install ${{ needs.version.outputs.version }} (${{ matrix.os }})
@@ -197,3 +207,975 @@ jobs:
           set -euo pipefail
           [ "$OUTCOME" = failure ] || { echo "expected failure, got $OUTCOME" >&2; exit 1; }
           [ -z "$BIN_DIR" ] || { echo "installed into $BIN_DIR" >&2; exit 1; }
+
+  # shellcheck reads install.sh as the POSIX sh it is written in, and
+  # PSScriptAnalyzer checks install.ps1 against the commands and types of
+  # Windows PowerShell 5.1 and PowerShell 7 as well as its default rules.
+  lint:
+    name: Lint the installers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: shellcheck
+        run: shellcheck --shell=sh install.sh
+
+      - name: PSScriptAnalyzer
+        shell: pwsh
+        run: |
+          $profiles = @(
+            'win-48_x64_10.0.17763.0_5.1.17763.316_x64_4.0.30319.42000_framework',
+            'win-8_x64_10.0.17763.0_7.0.0_x64_3.1.2_core'
+          )
+          $settings = @{
+            Rules = @{
+              PSUseCompatibleSyntax = @{ Enable = $true; TargetVersions = @('5.1', '7.0') }
+              PSUseCompatibleCommands = @{ Enable = $true; TargetProfiles = $profiles }
+              PSUseCompatibleTypes = @{ Enable = $true; TargetProfiles = $profiles }
+            }
+          }
+          $found = @(Invoke-ScriptAnalyzer -Path install.ps1 -Settings $settings)
+          $found | Format-List RuleName, Severity, Line, Message | Out-String | Write-Host
+          if ($found.Count -gt 0) {
+            Write-Error "PSScriptAnalyzer reported $($found.Count) findings"; exit 1
+          }
+
+  # The installers as someone runs them on a machine of their own, where the
+  # action runs inside a workflow: the store is set up where nova-nix looks
+  # for it, so the build passes no --store, and PATH is set in the files a
+  # new shell reads. The steps run in login shells, never through
+  # GITHUB_PATH, so each one sees what a new terminal would.
+  install-sh:
+    name: install.sh (${{ matrix.os }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash -l {0}
+    env:
+      # Installed first, so the release under test arrives as an upgrade.
+      UPGRADE_FROM: 0.9.0.0
+      VERSION: ${{ needs.version.outputs.version }}
+      RELEASE: ${{ needs.version.outputs.release }}
+      # The nixpkgs nova-nix's parity CI pins; cache.nixos.org holds its
+      # hello for both runners.
+      NIXPKGS_REV: 6f06d204d8f2d8761d9da78778745974a3216381
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # fish reads none of the POSIX startup files, so the installer writes
+      # into its conf.d when fish is installed, and the image has no fish.
+      - name: Install fish (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends fish
+
+      # The release's own files, for the steps that install from a directory.
+      # The names it sets differ from RELEASE in more than case, since
+      # Windows takes environment names without regard to case.
+      - name: Download ${{ env.RELEASE }}
+        run: |
+          set -euo pipefail
+          case ${RUNNER_OS} in
+            Linux) archive=nova-nix-linux-x64.tar.gz ;;
+            macOS) archive=nova-nix-macos-arm64.tar.gz ;;
+          esac
+          dir="${RUNNER_TEMP}/release"
+          mkdir -p "${dir}"
+          base="https://github.com/Novavero-AI/nova-nix/releases/download/v${RELEASE}"
+          curl -fsSL -o "${dir}/${archive}" "${base}/${archive}"
+          curl -fsSL -o "${dir}/SHA256SUMS" "${base}/SHA256SUMS"
+          {
+            echo "RELEASE_ARCHIVE=${archive}"
+            echo "RELEASE_DIR=${dir}"
+          } >> "${GITHUB_ENV}"
+
+      - name: Install ${{ env.UPGRADE_FROM }}
+        run: |
+          set -euo pipefail
+          sh install.sh --version "${UPGRADE_FROM}"
+
+      - name: A new shell runs ${{ env.UPGRADE_FROM }}
+        run: |
+          set -euo pipefail
+          got=$(nova-nix --version)
+          [ "${got}" = "nova-nix ${UPGRADE_FROM}" ] || { echo "expected nova-nix ${UPGRADE_FROM}, got ${got}" >&2; exit 1; }
+
+      # Piped into sh, as the one-line install runs it.
+      - name: Upgrade to ${{ env.RELEASE }}
+        run: |
+          set -euo pipefail
+          if [ "${VERSION}" = latest ]; then
+            sh < install.sh
+          else
+            sh -s -- --version "${VERSION}" < install.sh
+          fi
+
+      # Each shell starts with nothing but HOME and a bare PATH, so the
+      # nova-nix it finds comes from its own startup files.
+      - name: Every shell finds ${{ env.RELEASE }}
+        run: |
+          set -euo pipefail
+          expect="${HOME}/.nova-nix/bin/nova-nix
+          nova-nix ${RELEASE}"
+          check() {
+            got=$(env -i HOME="${HOME}" PATH=/usr/bin:/bin "$@" 'command -v nova-nix; nova-nix --version')
+            if [ "${got}" != "${expect}" ]; then
+              printf '%s found:\n%s\nexpected:\n%s\n' "$*" "${got}" "${expect}" >&2
+              return 1
+            fi
+            echo "$*: ok"
+          }
+          check sh -lc
+          check bash -lc
+          if [ -f "${HOME}/.bashrc" ]; then check bash -ic; fi
+          if command -v zsh >/dev/null; then check zsh -c; fi
+          if command -v fish >/dev/null; then check fish -c; fi
+
+      - name: The store is a case-sensitive volume of its own (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          field() { diskutil info -plist "$1" | plutil -extract "$2" raw -o - -; }
+          [ "$(field /nix VolumeName)" = 'nova-nix Store' ] || { echo "/nix is the volume '$(field /nix VolumeName)'" >&2; exit 1; }
+          [ "$(field /nix APFSContainerReference)" = "$(field / APFSContainerReference)" ] \
+            || { echo "/nix is not in the container / is in" >&2; exit 1; }
+          probe=$(mktemp -d /nix/case.XXXXXX)
+          touch "${probe}/a" "${probe}/A"
+          names=$(find "${probe}" -mindepth 1 | wc -l)
+          rm -r "${probe}"
+          [ "${names}" -eq 2 ] || { echo "/nix folds case" >&2; exit 1; }
+          grep -qxF "UUID=$(field /nix VolumeUUID) /nix apfs rw,noauto,nobrowse,suid,owners" /etc/fstab \
+            || { echo "fstab does not mount /nix's volume at /nix" >&2; exit 1; }
+          grep -x nix /etc/synthetic.conf
+          launchctl print system/ai.novavero.nova-nix.store > /dev/null
+          [ "$(stat -f %Su /nix)" = "$(id -un)" ] || { echo "/nix is not $(id -un)'s" >&2; exit 1; }
+
+      # A LaunchDaemon left naming a volume since replaced would stop /nix
+      # mounting at boot, so a run rewrites one that names another.
+      - name: A LaunchDaemon naming another volume is rewritten (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          plist=/Library/LaunchDaemons/ai.novavero.nova-nix.store.plist
+          volume=$(diskutil info -plist /nix | plutil -extract VolumeUUID raw -o - -)
+          sudo plutil -replace ProgramArguments.4 -string 00000000-0000-0000-0000-000000000000 "${plist}"
+          sh install.sh --from "${RELEASE_DIR}"
+          [ "$(plutil -extract ProgramArguments.4 raw -o - "${plist}")" = "${volume}" ] \
+            || { echo "the LaunchDaemon still names another volume" >&2; exit 1; }
+          launchctl print system/ai.novavero.nova-nix.store > /dev/null
+
+      - name: The store is the user's (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          [ "$(stat -c %U /nix)" = "$(id -un)" ] || { echo "/nix is not $(id -un)'s" >&2; exit 1; }
+
+      # A program from cache.nixos.org loads its libraries from /nix/store,
+      # so this runs only from the store the installer set up.
+      - name: Build GNU Hello with no --store
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/NixOS/nixpkgs/archive/${NIXPKGS_REV}.tar.gz" | tar -xz
+          out=$(nova-nix build --expr "(import ./nixpkgs-${NIXPKGS_REV} { }).hello" \
+            --substituter https://cache.nixos.org \
+            --trusted-key cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= \
+            | tail -n1)
+          echo "built: ${out}"
+          case ${out} in
+            /nix/store/*-hello-*) ;;
+            *) echo "not a path in /nix/store: ${out}" >&2; exit 1 ;;
+          esac
+          got=$("${out}/bin/hello")
+          [ "${got}" = 'Hello, world!' ] || { echo "hello printed ${got}" >&2; exit 1; }
+          echo "out=${out}" >> "${GITHUB_ENV}"
+
+      # Another account on the same machine: its install and its uninstall
+      # both find /nix is this user's, refuse it, and change none of it.
+      - name: A second user cannot take the store
+        run: |
+          set -euo pipefail
+          other=novanixother
+          share=$(mktemp -d /tmp/novanix-share.XXXXXX)
+          cp install.sh "${RELEASE_DIR}/${RELEASE_ARCHIVE}" "${RELEASE_DIR}/SHA256SUMS" "${share}/"
+          chmod -R a+rX "${share}"
+          case ${RUNNER_OS} in
+            Linux)
+              sudo useradd --create-home --shell /bin/sh "${other}"
+              ;;
+            macOS)
+              uid=4242
+              if dscl . -search /Users UniqueID "${uid}" | grep -q .; then echo "uid ${uid} is taken" >&2; exit 1; fi
+              sudo dscl . -create "/Users/${other}"
+              sudo dscl . -create "/Users/${other}" UniqueID "${uid}"
+              sudo dscl . -create "/Users/${other}" PrimaryGroupID 20
+              sudo dscl . -create "/Users/${other}" UserShell /bin/sh
+              sudo dscl . -create "/Users/${other}" NFSHomeDirectory "/Users/${other}"
+              sudo mkdir -p "/Users/${other}"
+              sudo chown "${uid}:20" "/Users/${other}"
+              ;;
+          esac
+          for action in install uninstall; do
+            case ${action} in
+              install) set -- --from "${share}" ;;
+              uninstall) set -- --uninstall --remove-store ;;
+            esac
+            if sudo -u "${other}" -H env PATH=/usr/bin:/bin:/usr/sbin:/sbin sh "${share}/install.sh" "$@" 2> refusal; then
+              echo "the second user's ${action} went ahead" >&2
+              exit 1
+            fi
+            cat refusal
+            grep -q 'belongs to uid' refusal
+            if grep -q chown refusal; then echo "the refusal says to take the store" >&2; exit 1; fi
+          done
+          [ -x "${out}/bin/hello" ] || { echo "the store changed" >&2; exit 1; }
+          got=$(env -i HOME="${HOME}" PATH=/usr/bin:/bin sh -lc 'nova-nix --version')
+          [ "${got}" = "nova-nix ${RELEASE}" ] || { echo "the install became ${got}" >&2; exit 1; }
+
+      # The release's own files install from a directory, and the same files
+      # with one byte added are refused, leaving the install as it was.
+      - name: A tampered archive is refused
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/tampered"
+          mkdir -p "${dir}"
+          cp "${RELEASE_DIR}/${RELEASE_ARCHIVE}" "${RELEASE_DIR}/SHA256SUMS" "${dir}/"
+          sh install.sh --from "${dir}"
+          printf x >> "${dir}/${RELEASE_ARCHIVE}"
+          if sh install.sh --from "${dir}" 2> "${dir}/refusal"; then
+            echo "installed a tampered archive" >&2
+            exit 1
+          fi
+          cat "${dir}/refusal"
+          grep -q "${RELEASE_ARCHIVE} does not match its checksum in SHA256SUMS" "${dir}/refusal"
+          got=$(env -i HOME="${HOME}" PATH=/usr/bin:/bin sh -lc 'nova-nix --version')
+          [ "${got}" = "nova-nix ${RELEASE}" ] || { echo "the install became ${got}" >&2; exit 1; }
+
+      - name: Uninstall, keeping the store
+        run: |
+          set -euo pipefail
+          sh install.sh --uninstall
+          [ ! -e "${HOME}/.nova-nix" ] || { echo "${HOME}/.nova-nix is still there" >&2; exit 1; }
+          [ -x "${out}/bin/hello" ] || { echo "the store went with it" >&2; exit 1; }
+
+      # Checked on its own, after the uninstall: the install directory is
+      # gone, so only the PATH a new shell builds can show a line left
+      # behind, and every file is read, not only those that exist.
+      - name: No startup file or new shell still names nova-nix
+        run: |
+          set -euo pipefail
+          left=
+          for rc in "${HOME}/.profile" "${HOME}/.bash_profile" "${HOME}/.bash_login" "${HOME}/.bashrc" \
+            "${HOME}/.zshenv" "${HOME}/.config/fish/conf.d/nova-nix.fish"; do
+            if [ -e "${rc}" ] && grep -qF 'added by the nova-nix installer' "${rc}"; then
+              left="${left} ${rc}"
+            fi
+          done
+          [ -z "${left}" ] || { echo "still names nova-nix:${left}" >&2; exit 1; }
+          bin="${HOME}/.nova-nix/bin"
+          shells=("sh -lc" "bash -lc")
+          if [ -f "${HOME}/.bashrc" ]; then shells+=("bash -ic"); fi
+          if command -v zsh >/dev/null; then shells+=("zsh -c"); fi
+          for s in "${shells[@]}"; do
+            read -r -a invocation <<< "${s}"
+            # shellcheck disable=SC2016 # The new shell expands its own PATH.
+            path=$(env -i HOME="${HOME}" PATH=/usr/bin:/bin "${invocation[@]}" 'printf %s "${PATH}"')
+            case ":${path}:" in
+              *":${bin}:"*) echo "${s} still puts ${bin} on PATH: ${path}" >&2; exit 1 ;;
+            esac
+            echo "${s}: ok"
+          done
+          if command -v fish >/dev/null; then
+            # shellcheck disable=SC2016 # fish expands its own PATH.
+            path=$(env -i HOME="${HOME}" PATH=/usr/bin:/bin fish -c 'string join : $PATH')
+            case ":${path}:" in
+              *":${bin}:"*) echo "fish still puts ${bin} on PATH: ${path}" >&2; exit 1 ;;
+            esac
+            echo "fish -c: ok"
+          fi
+
+      - name: Uninstall the store too
+        run: |
+          set -euo pipefail
+          sh install.sh --uninstall --remove-store
+          case ${RUNNER_OS} in
+            Linux)
+              [ ! -e /nix ] || { echo "/nix is still there" >&2; exit 1; }
+              ;;
+            macOS)
+              if diskutil info 'nova-nix Store' > /dev/null 2>&1; then echo "the volume is still there" >&2; exit 1; fi
+              if grep -s ' /nix ' /etc/fstab; then echo "fstab still mounts /nix" >&2; exit 1; fi
+              if grep -s -x nix /etc/synthetic.conf; then echo "synthetic.conf still makes /nix" >&2; exit 1; fi
+              [ ! -e /Library/LaunchDaemons/ai.novavero.nova-nix.store.plist ] || { echo "the LaunchDaemon is still there" >&2; exit 1; }
+              if launchctl print system/ai.novavero.nova-nix.store > /dev/null 2>&1; then echo "the LaunchDaemon is still loaded" >&2; exit 1; fi
+              ;;
+          esac
+
+      - name: A ~/.nova-nix that is not an install is left alone
+        run: |
+          set -euo pipefail
+          mkdir "${HOME}/.nova-nix"
+          echo mine > "${HOME}/.nova-nix/notes"
+          if sh install.sh --from "${RELEASE_DIR}" 2> refusal; then echo "installed over it" >&2; exit 1; fi
+          grep -q 'does not hold a nova-nix install' refusal
+          if sh install.sh --uninstall 2> refusal; then echo "uninstalled it" >&2; exit 1; fi
+          grep -q 'does not hold a nova-nix install' refusal
+          [ "$(cat "${HOME}/.nova-nix/notes")" = mine ] || { echo "its contents changed" >&2; exit 1; }
+          rm -r "${HOME}/.nova-nix"
+
+      # Upstream's database where its store keeps it, which is all nova-nix
+      # and the installer look for.
+      - name: A store upstream Nix manages is left alone (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo mkdir -p /nix/var/nix/db
+          sudo touch /nix/var/nix/db/db.sqlite
+          sh install.sh --from "${RELEASE_DIR}" 2> notice
+          cat notice
+          grep -q 'upstream Nix manages /nix/store' notice
+          if sh install.sh --uninstall --remove-store 2> refusal; then echo "removed upstream's store" >&2; exit 1; fi
+          grep -q 'upstream Nix manages /nix/store on this machine; leaving everything in place' refusal
+          [ -x "${HOME}/.nova-nix/bin/nova-nix" ] || { echo "removed the install before refusing" >&2; exit 1; }
+          [ -e /nix/var/nix/db/db.sqlite ] || { echo "touched upstream's database" >&2; exit 1; }
+          sh install.sh --uninstall
+          sudo rm -r /nix
+
+      # A /nix of root's is taken over only when it is empty; one holding
+      # anything, or one that is a link, is refused and left as it was.
+      - name: A /nix of root's is taken over only when empty (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+          sudo mkdir -m 0755 /nix
+          sh install.sh --from "${RELEASE_DIR}" 2> notice
+          cat notice
+          grep -q "Giving /nix, which is root's and empty, to $(id -un)" notice
+          [ "$(stat -c %U /nix)" = "$(id -un)" ] || { echo "/nix was not taken over" >&2; exit 1; }
+          sh install.sh --uninstall --remove-store
+          [ ! -e /nix ] || { echo "/nix is still there" >&2; exit 1; }
+          sudo mkdir -p /nix/someone-else
+          for action in install rerun uninstall; do
+            case ${action} in
+              install | rerun) set -- --from "${RELEASE_DIR}" ;;
+              uninstall) set -- --uninstall --remove-store ;;
+            esac
+            if sh install.sh "$@" 2> refusal; then echo "${action} went ahead over a /nix holding something" >&2; exit 1; fi
+            cat refusal
+            grep -q 'belongs to uid 0 and is not empty' refusal
+          done
+          [ "$(stat -c %U /nix)" = root ] && [ -d /nix/someone-else ] || { echo "/nix changed" >&2; exit 1; }
+          sudo rm -r /nix
+          sudo ln -s /tmp /nix
+          if sh install.sh --from "${RELEASE_DIR}" 2> refusal; then echo "set up through a /nix that is a link" >&2; exit 1; fi
+          cat refusal
+          grep -q '/nix is a symbolic link' refusal
+          sudo rm /nix
+
+      # The volume's own root decides whose the store is: read on a private
+      # mount point when the volume is not mounted, taken over when it is
+      # root's and holds only what macOS makes there itself (the volume being
+      # of the installer's record), and refused, on every run and on
+      # uninstall, when it is root's and holds anything else. Nothing is left
+      # mounted under /private/tmp.
+      - name: Whose the store volume is (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          field() { diskutil info -plist "$1" | plutil -extract "$2" raw -o - -; }
+          no_private_mount() {
+            if mount | grep -F ' on /private/tmp/nova-nix-volume.'; then echo "a mount to look at the volume is left" >&2; exit 1; fi
+          }
+          sh install.sh --from "${RELEASE_DIR}"
+          volume=$(field /nix VolumeUUID)
+          sudo diskutil unmount /nix
+          sh install.sh --from "${RELEASE_DIR}"
+          [ "$(field /nix VolumeUUID)" = "${volume}" ] || { echo "/nix is not mounted from its volume again" >&2; exit 1; }
+          no_private_mount
+          sudo chown 0:0 /nix
+          echo "the volume's root holds:"
+          ls -lA /nix
+          if [ -d /nix/.Trashes ]; then sudo ls -lAR /nix/.Trashes; fi
+          # The per-user trash macOS keeps in .Trashes for this user, which a
+          # takeover leaves as it is.
+          own=$(sudo find /nix/.Trashes -mindepth 1 -maxdepth 1 -user "$(id -u)" -print -quit)
+          [ -n "${own}" ] || { echo "precondition: /nix/.Trashes holds no entry of $(id -un)'s" >&2; exit 1; }
+          held=$(ls -A /nix)
+          sh install.sh --from "${RELEASE_DIR}"
+          [ "$(stat -f %Su /nix)" = "$(id -un)" ] || { echo "the root of root's was not taken over" >&2; exit 1; }
+          printf '%s\n' "${held}" | while IFS= read -r name; do
+            [ -z "${name}" ] || [ -e "/nix/${name}" ] || { echo "taking it over removed /nix/${name}" >&2; exit 1; }
+          done
+          sudo test -e "${own}" || { echo "taking it over removed ${own}" >&2; exit 1; }
+          # One of the system's names that is this user's, or a link, at a
+          # recorded root of root's: refused. The link is .TemporaryItems,
+          # since the .Trashes macOS made holds what it put there.
+          [ ! -e /nix/.TemporaryItems ] || { echo "precondition: macOS made /nix/.TemporaryItems" >&2; exit 1; }
+          mkdir /nix/.TemporaryItems
+          sudo chown 0:0 /nix
+          if sh install.sh --from "${RELEASE_DIR}" 2> refusal; then echo "took over a root whose .TemporaryItems is this user's" >&2; exit 1; fi
+          cat refusal
+          grep -q 'is not empty' refusal
+          sudo rmdir /nix/.TemporaryItems
+          sudo ln -s /tmp /nix/.TemporaryItems
+          if sh install.sh --from "${RELEASE_DIR}" 2> refusal; then echo "took over a root whose .TemporaryItems is a link" >&2; exit 1; fi
+          cat refusal
+          grep -q 'is not empty' refusal
+          sudo rm /nix/.TemporaryItems
+          sudo chown "$(id -u):$(id -g)" /nix
+          sudo mkdir /nix/someone-else
+          sudo chown 0:0 /nix
+          for action in install rerun; do
+            if sh install.sh --from "${RELEASE_DIR}" 2> refusal; then echo "${action} went ahead over a root holding something" >&2; exit 1; fi
+            cat refusal
+            grep -q 'belongs to uid 0 and is not empty' refusal
+          done
+          sudo diskutil unmount /nix
+          if sh install.sh --uninstall --remove-store 2> refusal; then echo "uninstall went ahead" >&2; exit 1; fi
+          cat refusal
+          grep -q 'belongs to uid 0 and is not empty' refusal
+          no_private_mount
+          field "${volume}" VolumeName > /dev/null || { echo "the volume was deleted" >&2; exit 1; }
+          sudo diskutil mount -mountPoint /nix "${volume}"
+          [ -d /nix/someone-else ] && [ "$(stat -f %u /nix)" = 0 ] || { echo "the volume's root changed" >&2; exit 1; }
+          sudo rmdir /nix/someone-else
+          sudo chown "$(id -u):$(id -g)" /nix
+          sh install.sh --uninstall --remove-store
+          if diskutil info "${volume}" > /dev/null 2>&1; then echo "the volume is still there" >&2; exit 1; fi
+
+      # A volume named like the store's on another disk, as a cloned backup
+      # would be: neither adopted nor deleted, even when fstab names it.
+      - name: A store volume on another disk is left alone (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          set -euo pipefail
+          field() { diskutil info -plist "$1" | plutil -extract "$2" raw -o - -; }
+          hdiutil create -size 64m -fs APFS -volname 'nova-nix Store' "${RUNNER_TEMP}/clone.dmg"
+          hdiutil attach -nobrowse "${RUNNER_TEMP}/clone.dmg"
+          clone=$(field '/Volumes/nova-nix Store' VolumeUUID)
+          echo "clone: ${clone} in $(field "${clone}" APFSContainerReference); / is in $(field / APFSContainerReference)"
+          line="UUID=${clone} /nix apfs rw,noauto,nobrowse,suid,owners"
+          echo "${line}" | sudo tee -a /etc/fstab > /dev/null
+          if sh install.sh --from "${RELEASE_DIR}" 2> refusal; then echo "installed onto the clone" >&2; exit 1; fi
+          cat refusal
+          grep -q 'which this installer did not create in' refusal
+          if grep -s -x nix /etc/synthetic.conf; then echo "changed synthetic.conf before refusing" >&2; exit 1; fi
+          if sh install.sh --uninstall --remove-store 2> refusal; then echo "uninstall took the clone" >&2; exit 1; fi
+          cat refusal
+          grep -q 'which this installer did not create in' refusal
+          grep -v -x -F "${line}" /etc/fstab | sudo tee /etc/fstab.kept > /dev/null || :
+          sudo mv /etc/fstab.kept /etc/fstab
+          sh install.sh --from "${RELEASE_DIR}"
+          [ "$(field /nix VolumeUUID)" != "${clone}" ] || { echo "adopted the clone" >&2; exit 1; }
+          [ "$(field /nix APFSContainerReference)" = "$(field / APFSContainerReference)" ] \
+            || { echo "/nix is not in the container / is in" >&2; exit 1; }
+          sh install.sh --uninstall --remove-store
+          field "${clone}" VolumeName > /dev/null || { echo "deleted the clone" >&2; exit 1; }
+          if diskutil info -plist /nix > /dev/null 2>&1; then echo "/nix is still mounted" >&2; exit 1; fi
+          hdiutil detach '/Volumes/nova-nix Store'
+
+  install-ps1:
+    name: install.ps1 (${{ matrix.shell }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        # Windows PowerShell 5.1 comes with Windows, and PowerShell 7 is
+        # installed beside it.
+        shell: [powershell, pwsh]
+    runs-on: windows-latest
+    # The installer runs in the shell under test; the checks run in pwsh.
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    env:
+      UPGRADE_FROM: 0.9.0.0
+      VERSION: ${{ needs.version.outputs.version }}
+      RELEASE: ${{ needs.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      # The release's own files, for the steps that install from a folder.
+      # RELEASE_DIR differs from RELEASE in more than case, since Windows
+      # takes environment names without regard to case.
+      - name: Download ${{ env.RELEASE }}
+        shell: pwsh
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $dir = Join-Path $env:RUNNER_TEMP 'release'
+          [void](New-Item -ItemType Directory -Force -Path $dir)
+          $base = "https://github.com/Novavero-AI/nova-nix/releases/download/v$env:RELEASE"
+          Invoke-WebRequest -Uri "$base/nova-nix-windows-x64.zip" -OutFile (Join-Path $dir 'nova-nix-windows-x64.zip')
+          Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile (Join-Path $dir 'SHA256SUMS')
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "RELEASE_DIR=$dir"
+
+      - name: Install ${{ env.UPGRADE_FROM }}
+        run: |
+          & ([scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))) -Version $env:UPGRADE_FROM
+
+      # A new terminal's Path is the machine Path and then the user Path, as
+      # the registry holds them; a step's own Path is the runner's.
+      - name: A new terminal runs ${{ env.UPGRADE_FROM }}
+        shell: pwsh
+        run: |
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+          $exe = (Get-Command nova-nix).Source
+          $expected = Join-Path $env:LOCALAPPDATA 'Programs\nova-nix\bin\nova-nix.exe'
+          if ($exe -ne $expected) { Write-Error "found $exe, not $expected"; exit 1 }
+          $got = nova-nix --version
+          if ($got -cne "nova-nix $env:UPGRADE_FROM") { Write-Error "expected nova-nix $env:UPGRADE_FROM, got $got"; exit 1 }
+
+      # Through Invoke-Expression, as the one-line install runs it.
+      - name: Upgrade to ${{ env.RELEASE }}
+        run: |
+          if ($env:VERSION -eq 'latest') {
+            Get-Content -Raw -LiteralPath install.ps1 | Invoke-Expression
+          } else {
+            & ([scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))) -Version $env:VERSION
+          }
+
+      - name: A new terminal runs ${{ env.RELEASE }}
+        shell: pwsh
+        run: |
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+          $entries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ -like '*nova-nix*' })
+          if ($entries.Count -ne 1) { Write-Error "the user Path holds $($entries.Count) nova-nix entries: $entries"; exit 1 }
+          $got = nova-nix --version
+          if ($got -cne "nova-nix $env:RELEASE") { Write-Error "expected nova-nix $env:RELEASE, got $got"; exit 1 }
+
+      - name: Build GNU Hello with no --store
+        shell: pwsh
+        env:
+          LC_ALL: C
+        run: |
+          $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+          $recipe = Join-Path $env:LOCALAPPDATA 'Programs\nova-nix\pkgs\windows\hello.nix'
+          $out = nova-nix build $recipe `
+            --substituter https://cache.novavero.ai `
+            --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ= |
+            Select-Object -Last 1
+          if ($LASTEXITCODE -ne 0) { Write-Error "nova-nix build failed with exit code $LASTEXITCODE"; exit 1 }
+          Write-Host "built: $out"
+          if (-not "$out".StartsWith('C:\nix\store\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-Error "not a path in C:\nix\store: $out"; exit 1
+          }
+          $got = (& (Join-Path $out 'bin\hello.exe')) -join "`n"
+          if ($LASTEXITCODE -ne 0) { Write-Error "hello failed with exit code $LASTEXITCODE"; exit 1 }
+          if ($got -cne 'Hello, world!') { Write-Error "hello printed '$got'"; exit 1 }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "out=$out"
+
+      # No entry inherited from C:\, where every signed-in user may modify:
+      # only this user, SYSTEM and Administrators own or can change the store
+      # or what is in it. Generic write and all rights count as well as the
+      # specific ones.
+      - name: Only this user, SYSTEM and Administrators can change the store
+        shell: pwsh
+        run: |
+          $writes = [int][System.Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteExtendedAttributes, DeleteSubdirectoriesAndFiles, WriteAttributes, Delete, ChangePermissions, TakeOwnership'
+          $generic = 0x10000000 -bor 0x40000000
+          $allowed = @(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+            'S-1-5-18',
+            'S-1-5-32-544'
+          )
+          if (-not (Get-Acl -LiteralPath 'C:\nix').AreAccessRulesProtected) { Write-Error 'C:\nix inherits from C:\'; exit 1 }
+          foreach ($path in 'C:\nix', 'C:\nix\store', $env:out) {
+            icacls $path
+            $acl = Get-Acl -LiteralPath $path
+            $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+            if ($allowed -notcontains $owner) { Write-Error "$path belongs to $owner"; exit 1 }
+            foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+              $rights = [int]$rule.FileSystemRights
+              if ($rule.AccessControlType -eq 'Allow' -and ($rights -band ($writes -bor $generic)) -and $allowed -notcontains $rule.IdentityReference.Value) {
+                Write-Error "$path lets $($rule.IdentityReference.Value) change it ($($rule.FileSystemRights))"; exit 1
+              }
+            }
+          }
+
+      # The release's own files install from a folder, and the same files
+      # with one byte added are refused, leaving the install as it was.
+      - name: A tampered archive is refused
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'tampered'
+          $zip = Join-Path $dir 'nova-nix-windows-x64.zip'
+          [void](New-Item -ItemType Directory -Force -Path $dir)
+          Copy-Item -Path (Join-Path $env:RELEASE_DIR '*') -Destination $dir
+          $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))
+          & $installer -From $dir
+          $stream = [System.IO.File]::Open($zip, [System.IO.FileMode]::Append, [System.IO.FileAccess]::Write)
+          try { $stream.WriteByte(0x78) } finally { $stream.Close() }
+          $refusal = $null
+          try { & $installer -From $dir } catch { $refusal = $_.Exception.Message }
+          if ($null -eq $refusal) { throw 'installed a tampered archive' }
+          Write-Host "refused: $refusal"
+          if ($refusal -notlike '*nova-nix-windows-x64.zip does not match its checksum in SHA256SUMS*') {
+            throw "refused for another reason: $refusal"
+          }
+          $got = & (Join-Path $env:LOCALAPPDATA 'Programs\nova-nix\bin\nova-nix.exe') --version
+          if ($got -cne "nova-nix $env:RELEASE") { throw "the install became $got" }
+
+      # A C:\nix left with an extra entry, as one made before the installer
+      # would be, and an entry below it that another account can change:
+      # install refuses before writing C:\nix's DACL, a rerun refuses again,
+      # and -RemoveStore removes nothing.
+      - name: A store another account can change is refused on every run
+        run: |
+          $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))
+          $probe = 'C:\nix\probe'
+          [void](New-Item -ItemType Directory -Path $probe)
+          icacls $probe /grant '*S-1-1-0:(OI)(CI)M' | Out-Null
+          icacls 'C:\nix' /grant '*S-1-1-0:(OI)(CI)RX' | Out-Null
+          $before = (icacls 'C:\nix') -join "`n"
+          foreach ($arguments in @(@{ From = $env:RELEASE_DIR }, @{ From = $env:RELEASE_DIR }, @{ Uninstall = $true; RemoveStore = $true })) {
+            $refusal = $null
+            try { & $installer @arguments } catch { $refusal = $_.Exception.Message }
+            if ($null -eq $refusal) { throw "went ahead with $($arguments.Keys -join ', ') over an entry another account can change" }
+            Write-Host "refused: $refusal"
+            if ($refusal -notlike "*$probe lets S-1-1-0 change it*") { throw "refused for another reason: $refusal" }
+          }
+          if (((icacls 'C:\nix') -join "`n") -ne $before) { throw "C:\nix's DACL was written before refusing" }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Programs\nova-nix\bin\nova-nix.exe'))) { throw 'removed the install before refusing' }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:out 'bin\hello.exe'))) { throw 'removed the store before refusing' }
+          Remove-Item -LiteralPath $probe
+          & $installer -From $env:RELEASE_DIR
+          # Writing C:\nix's DACL reaches what is below it: the Everyone
+          # entry C:\nix had is no longer inherited there.
+          foreach ($path in 'C:\nix\store', $env:out) {
+            icacls $path
+            if ((icacls $path) -match 'Everyone') { throw "$path still carries the Everyone entry C:\nix had" }
+          }
+
+      # An inherit-only grant gives nothing on the directory it is on but
+      # everything made in it after: a store directory carrying one for Users
+      # to modify is refused on every run, and left as it was.
+      - name: An inherit-only grant below C:\nix is refused on every run
+        run: |
+          $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))
+          icacls 'C:\nix\store' /grant '*S-1-5-32-545:(OI)(CI)(IO)(M)' | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'could not grant the inherit-only entry' }
+          $before = (icacls 'C:\nix\store') -join "`n"
+          foreach ($arguments in @(@{ From = $env:RELEASE_DIR }, @{ From = $env:RELEASE_DIR }, @{ Uninstall = $true; RemoveStore = $true })) {
+            $refusal = $null
+            try { & $installer @arguments } catch { $refusal = $_.Exception.Message }
+            if ($null -eq $refusal) { throw "went ahead with $($arguments.Keys -join ', ') over an inherit-only grant to Users" }
+            Write-Host "refused: $refusal"
+            if ($refusal -notlike '*C:\nix\store lets S-1-5-32-545 change it*') { throw "refused for another reason: $refusal" }
+          }
+          if (((icacls 'C:\nix\store') -join "`n") -ne $before) { throw "C:\nix\store's DACL changed before refusing" }
+          icacls 'C:\nix\store' /remove:g '*S-1-5-32-545' | Out-Null
+          & $installer -From $env:RELEASE_DIR
+
+      # Another account named in C:\nix's DACL is that account's store, which
+      # neither install nor uninstall takes: a local account, and an Entra ID
+      # account, whose SID is not a local account's.
+      - name: A C:\nix granted to another account is left alone
+        run: |
+          $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))
+          # net user asks for confirmation of a password longer than 14
+          # characters, so this one is 14.
+          net user novanix-other ('Aa1-' + [guid]::NewGuid().ToString('N').Substring(0, 10)) /add | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'could not create the other account' }
+          $local = ([System.Security.Principal.NTAccount]'novanix-other').Translate([System.Security.Principal.SecurityIdentifier]).Value
+          $entra = 'S-1-12-1-1111111111-2222222222-3333333333-3444444444'
+          # icacls resolves a SID before granting it, and the Entra one names
+          # no account on this runner, so the entry is written from the SID
+          # itself, through the calls the installer writes C:\nix's DACL with.
+          function Write-RootAcl([System.Security.AccessControl.DirectorySecurity]$Acl) {
+            $directory = Get-Item -LiteralPath 'C:\nix'
+            if ($PSVersionTable.PSEdition -eq 'Desktop') {
+              $directory.SetAccessControl($Acl)
+            } else {
+              [System.IO.FileSystemAclExtensions]::SetAccessControl($directory, $Acl)
+            }
+          }
+          foreach ($given in $local, $entra) {
+            # The SID as Windows stores it, which the refusal names.
+            $sid = [System.Security.Principal.SecurityIdentifier]::new($given).Value
+            $grant = [System.Security.AccessControl.FileSystemAccessRule]::new(
+              [System.Security.Principal.SecurityIdentifier]::new($sid),
+              [System.Security.AccessControl.FileSystemRights]::FullControl,
+              [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit',
+              [System.Security.AccessControl.PropagationFlags]::None,
+              [System.Security.AccessControl.AccessControlType]::Allow)
+            $acl = Get-Acl -LiteralPath 'C:\nix'
+            $acl.AddAccessRule($grant)
+            Write-RootAcl $acl
+            $before = (icacls 'C:\nix') -join "`n"
+            foreach ($arguments in @(@{ From = $env:RELEASE_DIR }, @{ From = $env:RELEASE_DIR }, @{ Uninstall = $true; RemoveStore = $true })) {
+              $refusal = $null
+              try { & $installer @arguments } catch { $refusal = $_.Exception.Message }
+              if ($null -eq $refusal) { throw "went ahead with $($arguments.Keys -join ', ') over a grant to $sid" }
+              Write-Host "refused: $refusal"
+              if ($refusal -notlike "*C:\nix lets $sid change it*") { throw "refused for another reason: $refusal" }
+            }
+            if (((icacls 'C:\nix') -join "`n") -ne $before) { throw "C:\nix's DACL was written over the grant to $sid" }
+            if (-not (Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'Programs\nova-nix\bin\nova-nix.exe'))) { throw 'removed the install before refusing' }
+            $acl = Get-Acl -LiteralPath 'C:\nix'
+            if (-not $acl.RemoveAccessRule($grant)) { throw "could not take the grant to $sid out again" }
+            Write-RootAcl $acl
+          }
+          & $installer -From $env:RELEASE_DIR
+
+      # A link below C:\nix is read as itself: one another account owns is
+      # refused on every run, whatever it leads to.
+      - name: A link another account owns is refused on every run
+        run: |
+          $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))
+          $link = 'C:\nix\probe-link'
+          [void](New-Item -ItemType SymbolicLink -Path $link -Target $env:RUNNER_TEMP)
+          icacls $link /setowner novanix-other /L | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'could not give the link to the other account' }
+          $other = ([System.Security.Principal.NTAccount]'novanix-other').Translate([System.Security.Principal.SecurityIdentifier]).Value
+          foreach ($arguments in @(@{ From = $env:RELEASE_DIR }, @{ From = $env:RELEASE_DIR }, @{ Uninstall = $true; RemoveStore = $true })) {
+            $refusal = $null
+            try { & $installer @arguments } catch { $refusal = $_.Exception.Message }
+            if ($null -eq $refusal) { throw "went ahead with $($arguments.Keys -join ', ') over a link another account owns" }
+            Write-Host "refused: $refusal"
+            if ($refusal -notlike "*$link belongs to $other*") { throw "refused for another reason: $refusal" }
+          }
+          (Get-Item -LiteralPath $link -Force).Delete()
+          & $installer -From $env:RELEASE_DIR
+
+      - name: Uninstall, keeping the store
+        run: |
+          & ([scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))) -Uninstall
+
+      - name: Only the store is left
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:LOCALAPPDATA 'Programs\nova-nix'
+          if (Test-Path -LiteralPath $root) { Write-Error "$root is still there"; exit 1 }
+          $entries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ -like '*nova-nix*' })
+          if ($entries.Count -ne 0) { Write-Error "the user Path still holds $entries"; exit 1 }
+          if (-not (Test-Path -LiteralPath (Join-Path $env:out 'bin\hello.exe'))) { Write-Error 'the store went with it'; exit 1 }
+
+      - name: A nova-nix folder that is not an install is left alone
+        run: |
+          $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))
+          $root = Join-Path $env:LOCALAPPDATA 'Programs\nova-nix'
+          [void](New-Item -ItemType Directory -Path $root)
+          Set-Content -LiteralPath (Join-Path $root 'notes.txt') -Value 'mine'
+          foreach ($arguments in @(@{ From = $env:RELEASE_DIR }, @{ Uninstall = $true })) {
+            $refusal = $null
+            try { & $installer @arguments } catch { $refusal = $_.Exception.Message }
+            if ($null -eq $refusal) { throw "went ahead with $($arguments.Keys -join ', ')" }
+            if ($refusal -notlike '*does not hold a nova-nix install*') { throw "refused for another reason: $refusal" }
+          }
+          if ((Get-Content -LiteralPath (Join-Path $root 'notes.txt')) -cne 'mine') { throw 'its contents changed' }
+          Remove-Item -LiteralPath $root -Recurse
+
+      # A store that is a link would be removed while what it leads to is
+      # kept, so -RemoveStore refuses it.
+      - name: A store that is a link is not removed
+        run: |
+          $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))
+          Rename-Item -LiteralPath 'C:\nix\store' -NewName 'kept'
+          [void](New-Item -ItemType Junction -Path 'C:\nix\store' -Target 'C:\nix\kept')
+          $refusal = $null
+          try { & $installer -Uninstall -RemoveStore } catch { $refusal = $_.Exception.Message }
+          if ($null -eq $refusal) { throw 'removed a store that is a link' }
+          if ($refusal -notlike '*C:\nix\store is not a directory of its own*') { throw "refused for another reason: $refusal" }
+          if (-not (Test-Path -LiteralPath ($env:out -replace '\\store\\', '\kept\'))) { throw 'what the link leads to went' }
+          (Get-Item -LiteralPath 'C:\nix\store' -Force).Delete()
+          Rename-Item -LiteralPath 'C:\nix\kept' -NewName 'store'
+
+      # A junction inside the store leading out of it: -RemoveStore removes
+      # the junction, never what it leads to.
+      - name: Put a junction to a folder outside the store in it
+        shell: pwsh
+        run: |
+          $outside = Join-Path $env:RUNNER_TEMP 'outside'
+          [void](New-Item -ItemType Directory -Force -Path $outside)
+          Set-Content -LiteralPath (Join-Path $outside 'kept.txt') -Value 'kept'
+          [void](New-Item -ItemType Junction -Path 'C:\nix\store\probe-junction' -Target $outside)
+
+      - name: Uninstall the store too
+        run: |
+          & ([scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))) -Uninstall -RemoveStore
+
+      - name: The store is gone, and nothing a link in it led to
+        shell: pwsh
+        run: |
+          if (Test-Path -LiteralPath 'C:\nix') { Write-Error 'C:\nix is still there'; exit 1 }
+          $kept = Join-Path $env:RUNNER_TEMP 'outside\kept.txt'
+          if (-not (Test-Path -LiteralPath $kept)) { Write-Error 'removing the store followed a junction out of it'; exit 1 }
+
+      # C:\nix as nova-nix leaves it when it makes C:\nix\store itself, with
+      # the drive root's grant of modify to Authenticated Users inherited: a
+      # store others could have written, which install, a rerun and
+      # -RemoveStore all refuse, changing nothing.
+      - name: A C:\nix carrying the drive root's permissions is refused on every run
+        run: |
+          $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))
+          [void](New-Item -ItemType Directory -Path 'C:\nix\store')
+          icacls 'C:\nix'
+          $before = (icacls 'C:\nix') -join "`n"
+          foreach ($arguments in @(@{ From = $env:RELEASE_DIR }, @{ From = $env:RELEASE_DIR }, @{ Uninstall = $true; RemoveStore = $true })) {
+            $refusal = $null
+            try { & $installer @arguments } catch { $refusal = $_.Exception.Message }
+            if ($null -eq $refusal) { throw "went ahead with $($arguments.Keys -join ', ') over a C:\nix others can change" }
+            Write-Host "refused: $refusal"
+            if ($refusal -notmatch '^C:\\nix lets S-1-[0-9-]+ change it') { throw "refused for another reason: $refusal" }
+            if ($refusal -notlike '*move C:\nix aside*') { throw "the refusal does not say to move C:\nix aside: $refusal" }
+          }
+          if (((icacls 'C:\nix') -join "`n") -ne $before) { throw "C:\nix's DACL was written before refusing" }
+          if (-not (Test-Path -LiteralPath 'C:\nix\store')) { throw 'removed the store before refusing' }
+          Remove-Item -LiteralPath 'C:\nix' -Recurse
+
+  # Hosted runners run as an administrator, which the job above installs
+  # as. Here a standard user does, who must create C:\nix with its DACL and
+  # write that DACL again with no privilege at all. A scheduled task is how
+  # the runner starts a process as another user.
+  install-ps1-user:
+    name: install.ps1 as a standard user
+    needs: version
+    runs-on: windows-latest
+    env:
+      RELEASE: ${{ needs.version.outputs.release }}
+      WORK: C:\novanix-user
+      USER_NAME: novanix-user
+      # How long the task has to start, how long it may run, and how often
+      # to look whether it has.
+      TASK_START_SECONDS: 120
+      TASK_TIMEOUT_SECONDS: 900
+      TASK_POLL_SECONDS: 5
+      # LastTaskResult while the task has not started, and while it runs.
+      TASK_NOT_RUN: 267011
+      TASK_RUNNING: 267009
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Lay out the installer and the release for the user
+        run: |
+          $ProgressPreference = 'SilentlyContinue'
+          $release = Join-Path $env:WORK 'release'
+          [void](New-Item -ItemType Directory -Force -Path $release, (Join-Path $env:WORK 'out'))
+          Copy-Item -LiteralPath install.ps1 -Destination $env:WORK
+          $base = "https://github.com/Novavero-AI/nova-nix/releases/download/v$env:RELEASE"
+          Invoke-WebRequest -Uri "$base/nova-nix-windows-x64.zip" -OutFile (Join-Path $release 'nova-nix-windows-x64.zip')
+          Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile (Join-Path $release 'SHA256SUMS')
+          # Run by the user under both PowerShells: install, then write
+          # C:\nix's DACL again after taking an entry out of it as its
+          # owner, then uninstall with the store.
+          Set-Content -LiteralPath (Join-Path $env:WORK 'flow.ps1') -Value @'
+          $ErrorActionPreference = 'Stop'
+          $work = Split-Path -Parent $PSCommandPath
+          $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath (Join-Path $work 'install.ps1')))
+          $release = Join-Path $work 'release'
+          $principal = [System.Security.Principal.WindowsPrincipal]::new([System.Security.Principal.WindowsIdentity]::GetCurrent())
+          if ($principal.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'running elevated' }
+          Write-Output "PowerShell $($PSVersionTable.PSVersion) as $([System.Security.Principal.WindowsIdentity]::GetCurrent().Name)"
+          & $installer -From $release
+          icacls 'C:\nix'
+          $acl = Get-Acl -LiteralPath 'C:\nix'
+          if (-not $acl.AreAccessRulesProtected) { throw 'C:\nix inherits from C:\' }
+          $users = [System.Security.Principal.SecurityIdentifier]::new([System.Security.Principal.WellKnownSidType]::BuiltinUsersSid, $null)
+          $narrowed = [System.Security.AccessControl.DirectorySecurity]::new()
+          $narrowed.SetAccessRuleProtection($true, $false)
+          foreach ($rule in $acl.GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier])) {
+            if ($rule.IdentityReference.Value -ne $users.Value) { $narrowed.AddAccessRule($rule) }
+          }
+          $directory = Get-Item -LiteralPath 'C:\nix'
+          if ($PSVersionTable.PSEdition -eq 'Desktop') {
+            $directory.SetAccessControl($narrowed)
+          } else {
+            [System.IO.FileSystemAclExtensions]::SetAccessControl($directory, $narrowed)
+          }
+          & $installer -From $release
+          $restored = (Get-Acl -LiteralPath 'C:\nix').GetAccessRules($true, $false, [System.Security.Principal.SecurityIdentifier]) |
+            Where-Object { $_.IdentityReference.Value -eq $users.Value }
+          if (-not $restored) { throw "the installer did not write C:\nix's DACL again" }
+          & $installer -Uninstall -RemoveStore
+          if (Test-Path -LiteralPath 'C:\nix') { throw 'C:\nix is still there' }
+          Write-Output 'ok'
+          '@
+          Set-Content -LiteralPath (Join-Path $env:WORK 'run.ps1') -Value @'
+          $work = Split-Path -Parent $PSCommandPath
+          $out = Join-Path $work 'out'
+          $code = 0
+          foreach ($shell in 'powershell.exe', 'pwsh.exe') {
+            & $shell -NoProfile -ExecutionPolicy Bypass -File (Join-Path $work 'flow.ps1') *> (Join-Path $out "$shell.log")
+            if ($LASTEXITCODE -ne 0) { $code = 1 }
+          }
+          Set-Content -LiteralPath (Join-Path $out 'exit.txt') -Value $code
+          '@
+
+      - name: Run it as a standard user
+        run: |
+          # net user asks for confirmation of a password longer than 14
+          # characters, so this one is 14.
+          $password = 'Aa1-' + [guid]::NewGuid().ToString('N').Substring(0, 10)
+          Write-Output "::add-mask::$password"
+          net user $env:USER_NAME $password /add | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'could not create the user'; exit 1 }
+          $sid = ([System.Security.Principal.NTAccount]$env:USER_NAME).Translate([System.Security.Principal.SecurityIdentifier]).Value
+
+          # A task that keeps a password logs its user on as a batch job,
+          # a right Windows Server gives only to Administrators, Backup
+          # Operators and Performance Log Users unless told otherwise.
+          $policy = Join-Path $env:RUNNER_TEMP 'batch-logon.inf'
+          $database = Join-Path $env:RUNNER_TEMP 'batch-logon.sdb'
+          secedit /export /cfg $policy /areas USER_RIGHTS | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'could not read the user rights'; exit 1 }
+          $lines = @(Get-Content -LiteralPath $policy)
+          if ($lines -match '^SeBatchLogonRight\s*=') {
+            $lines = $lines -replace '^(SeBatchLogonRight\s*=.*)$', "`$1,*$sid"
+          } else {
+            $lines = $lines -replace '^\[Privilege Rights\]$', "[Privilege Rights]`r`nSeBatchLogonRight = *$sid"
+          }
+          Set-Content -LiteralPath $policy -Value $lines -Encoding Unicode
+          secedit /configure /db $database /cfg $policy /areas USER_RIGHTS | Out-Null
+          if ($LASTEXITCODE -ne 0) { Write-Error 'could not grant the user the right to log on as a batch job'; exit 1 }
+
+          # Task Scheduler's own record of why a task did or did not run.
+          wevtutil set-log Microsoft-Windows-TaskScheduler/Operational /enabled:true
+          $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$env:WORK\run.ps1`""
+          [void](Register-ScheduledTask -TaskName $env:USER_NAME -Action $action -User $env:USER_NAME -Password $password -RunLevel Limited)
+          $lastRun = (Get-ScheduledTaskInfo -TaskName $env:USER_NAME).LastRunTime
+          Start-ScheduledTask -TaskName $env:USER_NAME
+
+          # A task that does not start within TASK_START_SECONDS, as when
+          # its logon is refused, fails here, not at the timeout.
+          $startBy = (Get-Date).AddSeconds([int]$env:TASK_START_SECONDS)
+          while ((Get-ScheduledTaskInfo -TaskName $env:USER_NAME).LastRunTime -eq $lastRun -and (Get-Date) -lt $startBy) {
+            Start-Sleep -Seconds ([int]$env:TASK_POLL_SECONDS)
+          }
+          $started = (Get-ScheduledTaskInfo -TaskName $env:USER_NAME).LastRunTime -ne $lastRun
+
+          # Waits for the task's own record of how it ended, or for the task
+          # to have stopped without leaving one.
+          $exit = Join-Path $env:WORK 'out\exit.txt'
+          $deadline = (Get-Date).AddSeconds([int]$env:TASK_TIMEOUT_SECONDS)
+          while ($started -and -not (Test-Path -LiteralPath $exit) -and (Get-Date) -lt $deadline) {
+            $result = (Get-ScheduledTaskInfo -TaskName $env:USER_NAME).LastTaskResult
+            $state = (Get-ScheduledTask -TaskName $env:USER_NAME).State
+            if ($state -ne 'Running' -and @([int]$env:TASK_NOT_RUN, [int]$env:TASK_RUNNING) -notcontains $result) {
+              break
+            }
+            Start-Sleep -Seconds ([int]$env:TASK_POLL_SECONDS)
+          }
+          Get-ChildItem -LiteralPath (Join-Path $env:WORK 'out') -Filter '*.log' | ForEach-Object {
+            Write-Output "::group::$($_.Name)"
+            Get-Content -LiteralPath $_.FullName
+            Write-Output '::endgroup::'
+          }
+          if (-not (Test-Path -LiteralPath $exit)) {
+            $events = @(Get-WinEvent -LogName Microsoft-Windows-TaskScheduler/Operational -MaxEvents 40 -ErrorAction SilentlyContinue)
+            Write-Output '::group::Task Scheduler events'
+            if ($events.Count -eq 0) { Write-Output 'Task Scheduler logged nothing' }
+            $events | Format-List TimeCreated, Id, LevelDisplayName, Message | Out-String -Width 200 | Write-Output
+            Write-Output '::endgroup::'
+            $info = Get-ScheduledTaskInfo -TaskName $env:USER_NAME
+            if (-not $started) { Write-Error "the task did not start within $env:TASK_START_SECONDS seconds (last result $($info.LastTaskResult))"; exit 1 }
+            Write-Error "the task did not finish (last result $($info.LastTaskResult))"; exit 1
+          }
+          if ((Get-Content -LiteralPath $exit) -ne '0') { Write-Error 'the installer failed as a standard user'; exit 1 }
