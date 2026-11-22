@@ -154,8 +154,7 @@ jobs:
 The archive ships the package recipes beside the executable, so a build needs
 nothing checked out. The recipes target Windows, so the job runs on a Windows
 runner. The public cache holds the closure nova-nix's main branch last built,
-so naming it downloads what it holds and builds only what it lacks; without it
-the build compiles the toolchain seeds first.
+so naming it downloads what it holds and builds only what it lacks.
 
 ```yaml
 jobs:
@@ -192,7 +191,8 @@ nova-nix publishes one archive per platform, built on the runner image GitHub
 calls latest for it, so those three are all that exist. On any other platform
 the installers and the action fail with an error naming it, rather than with a
 404 from the download. The exception is Windows on Arm, where `install.ps1`
-installs the x64 archive, which runs under emulation.
+installs the x64 archive, which Windows 11 runs under emulation; Windows 10 on
+Arm cannot run it.
 
 ## What it installs
 
