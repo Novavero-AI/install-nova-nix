@@ -678,7 +678,9 @@ jobs:
           sh install.sh --uninstall --remove-store
           field "${clone}" VolumeName > /dev/null || { echo "deleted the clone" >&2; exit 1; }
           if diskutil info -plist /nix > /dev/null 2>&1; then echo "/nix is still mounted" >&2; exit 1; fi
-          hdiutil detach '/Volumes/nova-nix Store'
+          # A process macOS runs can still hold the throwaway image's volume
+          # open, which a plain detach refuses as busy.
+          hdiutil detach -force '/Volumes/nova-nix Store'
 
   install-ps1:
     name: install.ps1 (${{ matrix.shell }})
