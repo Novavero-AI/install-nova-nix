@@ -4,15 +4,103 @@
 [![Version](https://img.shields.io/github/v/tag/Novavero-AI/install-nova-nix?label=version&color=purple)](https://github.com/Novavero-AI/install-nova-nix/tags)
 [![License](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 
-Install [nova-nix](https://github.com/Novavero-AI/nova-nix) in a GitHub Actions
-workflow. The action downloads a release archive, checks it against the
-release's published checksums, and adds it to `PATH`. No Haskell toolchain is
-needed.
+Install [nova-nix](https://github.com/Novavero-AI/nova-nix) on a machine, or in
+a GitHub Actions workflow. Both download a release archive, check it against
+the release's published checksums and put it on `PATH`; on a machine, the
+installer also sets up the store. No Haskell toolchain is needed.
 
 For what to do with nova-nix once it is installed, see
 [its README](https://github.com/Novavero-AI/nova-nix#readme).
 
-## Usage
+## On a machine
+
+Linux and macOS:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Novavero-AI/install-nova-nix/v1/install.sh | sh
+```
+
+Windows, in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/Novavero-AI/install-nova-nix/v1/install.ps1 | iex
+```
+
+Run it as yourself, not with `sudo`: it asks for your password when a step
+needs root. Then open a new terminal:
+
+```console
+$ nova-nix eval --expr '1 + 2'
+3
+```
+
+nova-nix is installed in `~/.nova-nix`, or `%LOCALAPPDATA%\Programs\nova-nix`
+on Windows. Its `bin/` goes on `PATH` through `~/.profile`, the bash startup
+files you have, `~/.zshenv` when zsh is installed and fish's `conf.d` when fish
+is, or through your user `Path` on Windows.
+
+### The store
+
+The installer sets up the store where nova-nix looks for it, so no command
+needs `--store`:
+
+- **Linux**: `/nix`, created with `sudo` and owned by you.
+- **macOS**: `/nix`, on a case-sensitive APFS volume of its own named
+  `nova-nix Store`, created with `sudo` on the disk `/` is on.
+  `/etc/synthetic.conf` makes the mount point, and a LaunchDaemon mounts the
+  volume there at boot with the options `/etc/fstab` gives it, as upstream
+  Nix's installer does. The volume is not encrypted, even when FileVault is
+  on.
+- **Windows**: `C:\nix`, created so that only you, SYSTEM and Administrators
+  can change it. nova-nix makes symbolic links, which Windows allows only in
+  Developer Mode (Settings, For developers) or an elevated shell, and the
+  installer says so when neither is on.
+
+Every run, install and uninstall alike, first checks that the store is yours.
+On Linux and macOS, `/nix` and everything in its store must be yours and
+writable by no one else, and `/nix` must not be a link. On Linux a `/nix` of
+root's that holds nothing at all is given to you; on macOS, so is the root of
+a store volume this installer recorded, when it is root's and holds only
+entries macOS makes there itself, which are left as they are. On Windows, `C:\nix` and everything
+in it must belong to you, SYSTEM or Administrators and grant no other account
+a change, whether directly or inherited from `C:\`; read and execute for
+Users is fine. A store that is not, or whose owner cannot be read, is left
+alone, and the installer stops before changing anything. A `C:\nix` that
+nova-nix made itself still carries the drive root's grant of modify to every
+signed-in user, so it is refused too: move it aside, and the installer makes
+a new one.
+
+Where upstream Nix already manages `/nix/store`, the installer leaves it alone,
+and nova-nix needs a store of its own through `--store`.
+
+### Versions, upgrades and removal
+
+Arguments go after `sh -s --`, or after the script block on Windows:
+
+```sh
+curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Novavero-AI/install-nova-nix/v1/install.sh | sh -s -- --version 0.10.0.0
+```
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/Novavero-AI/install-nova-nix/v1/install.ps1))) -Version 0.10.0.0
+```
+
+| `install.sh` | `install.ps1` | Does |
+| --- | --- | --- |
+| `--version VERSION` | `-Version VERSION` | Installs this release rather than the latest. |
+| `--from DIR` | `-From DIR` | Installs the archive in `DIR`, checked against `DIR`'s `SHA256SUMS`, rather than downloading it. |
+| `--uninstall` | `-Uninstall` | Removes nova-nix and the `PATH` entries the installer added. The store stays. |
+| `--remove-store` | `-RemoveStore` | With uninstall, removes the store and what the installer set up for it. |
+
+Run the installer again to upgrade: it replaces the install with the release
+it names.
+
+`--remove-store` removes the store only once the check above finds it yours,
+and refuses a store, or a directory holding it, that is a link. On macOS it
+deletes only the volume its own records name, never one it has no record of,
+such as one with the same name on another disk.
+
+## In GitHub Actions
 
 ```yaml
 steps:
@@ -20,20 +108,21 @@ steps:
   - run: nova-nix eval --expr '1 + 2'
 ```
 
-## Inputs
+The action sets up no store, so on a Linux or macOS runner a command that
+writes to the store needs `--store`.
+
+### Inputs
 
 | Name | Description | Required | Default |
 | --- | --- | --- | --- |
 | `version` | Version to install, with or without a leading `v` (for example `0.10.0.0`). `latest` installs the most recent release. | No | `latest` |
 
-## Outputs
+### Outputs
 
 | Name | Description |
 | --- | --- |
 | `bin-dir` | Directory added to `PATH`, containing the `nova-nix` executable. |
 | `archive` | Name of the release asset that was installed. |
-
-## Examples
 
 ### Pin a version
 
@@ -84,18 +173,26 @@ jobs:
           BIN: ${{ steps.nova.outputs.bin-dir }}
 ```
 
+### How it works
+
+A composite action: the steps run directly in your job, on your runner, with no
+Node bundle to build or audit. It resolves the platform, downloads the matching
+archive and the release's `SHA256SUMS`, verifies the archive against it,
+unpacks it under `RUNNER_TEMP`, and appends `bin/` to `GITHUB_PATH`.
+
 ## Platform support
 
-| Runner | Archive |
-| --- | --- |
-| `ubuntu-latest` | `nova-nix-linux-x64.tar.gz` |
-| `macos-latest` | `nova-nix-macos-arm64.tar.gz` |
-| `windows-latest` | `nova-nix-windows-x64.zip` |
+| Platform | Runner | Archive |
+| --- | --- | --- |
+| Linux x64 | `ubuntu-latest` | `nova-nix-linux-x64.tar.gz` |
+| macOS arm64 | `macos-latest` | `nova-nix-macos-arm64.tar.gz` |
+| Windows x64 | `windows-latest` | `nova-nix-windows-x64.zip` |
 
 nova-nix publishes one archive per platform, built on the runner image GitHub
-calls latest for it, so those three are all that exist. On any other runner
-the action fails with an error naming the platform, rather than with a 404 from
-the download.
+calls latest for it, so those three are all that exist. On any other platform
+the installers and the action fail with an error naming it, rather than with a
+404 from the download. The exception is Windows on Arm, where `install.ps1`
+installs the x64 archive, which runs under emulation.
 
 ## What it installs
 
@@ -103,29 +200,26 @@ The archive unpacks to a single directory holding `bin/`, `share/`, `pkgs/` and
 nova-nix's LICENSE, NOTICE and README.md, and only `bin/` goes on `PATH`.
 
 - `bin/`: the `nova-nix` executable. The Windows build needs only the Windows
-  system DLLs. The Linux build loads glibc, libm, zlib and GMP dynamically, and
-  the macOS build loads only libraries macOS ships, from `/usr/lib` and
-  `/System/Library/Frameworks`. This repository's tests run the executable on
-  all three hosted runners.
+  system DLLs. The Linux build loads glibc 2.38 or newer, libm, zlib and GMP
+  dynamically, and the macOS build, which needs macOS 26 or newer, loads only
+  libraries macOS ships, from `/usr/lib` and `/System/Library/Frameworks`.
+  This repository's tests run the executable on all three hosted runners.
 - `share/`: the bundled `<nix/*>` search path, resolved relative to the
   executable, which is what lets an installed nova-nix build rather than only
   evaluate.
-- `pkgs/`: the package recipes, reachable at
+- `pkgs/`: the package recipes, beside `bin/`; in the action, that is
   `${{ steps.<id>.outputs.bin-dir }}/../pkgs`.
 
-## How it works
+## Checksums
 
-A composite action: the steps run directly in your job, on your runner, with no
-Node bundle to build or audit. It resolves the platform, downloads the matching
-archive and the release's `SHA256SUMS`, verifies the archive against it,
-unpacks it under `RUNNER_TEMP`, and appends `bin/` to `GITHUB_PATH`.
-
-Verification happens before anything is unpacked, so a truncated or corrupted
-download, or an archive that does not match its release's checksum, fails the
-step before anything reaches `PATH`. The checksums come from the same release
-as the archive, so this shows the download is intact, not who published it.
-With `latest`, a release published between the two downloads fails the check;
-pin `version` for a reproducible install.
+The archive is checked against its release's `SHA256SUMS` before anything is
+unpacked, so a truncated or corrupted download, or an archive that does not
+match its release's checksum, is refused before anything changes. The checksums
+come from the same release as the archive, so this shows the download is
+intact, not who published it. The installers read the latest release's version
+once and download both files from that release. The action's `latest` can fail
+when a release is published between its two downloads; pin `version` for a
+reproducible install.
 
 ## License
 

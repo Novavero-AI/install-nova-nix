@@ -22,20 +22,21 @@ jobs:
     uses: ./.github/workflows/test.yml
 
   # Users run the v1 tag, which major-tag.yml moves when a v1.x.y release tag
-  # is pushed, and test.yml runs the action as checked out, so a change to
-  # action.yml reaches nobody until a release moves v1, and no job there can
-  # see that it has not.
+  # is pushed: the action, and the installers the README's one-line installs
+  # fetch from it. test.yml runs them as checked out, so a change to any of
+  # them reaches nobody until a release moves v1, and no job there can see
+  # that it has not.
   tag:
-    name: v1 carries main's action
+    name: v1 carries main's action and installers
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
-      - name: action.yml matches v1
+      - name: action.yml and the installers match v1
         run: |
-          if ! git diff --exit-code refs/tags/v1 HEAD -- action.yml; then
-            echo "::error::action.yml on main differs from v1, so users do not have this change. Tag a release from main to move v1."
+          if ! git diff --exit-code refs/tags/v1 HEAD -- action.yml install.sh install.ps1; then
+            echo "::error::main differs from v1, so users do not have this change. Tag a release from main to move v1."
             exit 1
           fi
