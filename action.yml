@@ -1,5 +1,5 @@
 name: Install nova-nix
-description: Install a released nova-nix and put it on PATH. No toolchain required.
+description: Install a released nova-nix, put it on PATH and set up its store. No toolchain required.
 author: Novavero AI Inc.
 
 branding:
@@ -161,3 +161,19 @@ runs:
         echo "${root}/bin" >> "${GITHUB_PATH}"
         echo "bin-dir=${root}/bin" >> "${GITHUB_OUTPUT}"
         echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
+
+    # The installer that ships beside this file sets up the store, with every
+    # check it makes on a machine that the store is this user's. It sets up
+    # the store alone: nova-nix stays under RUNNER_TEMP, and PATH goes through
+    # GITHUB_PATH rather than the runner's shell startup files.
+    - name: Set up the store
+      if: runner.os != 'Windows'
+      shell: bash
+      run: sh "${GITHUB_ACTION_PATH}/install.sh" --store-only
+
+    # Windows PowerShell comes with every Windows, where PowerShell 7 is
+    # installed apart; install.ps1 runs in both.
+    - name: Set up the store
+      if: runner.os == 'Windows'
+      shell: powershell
+      run: '& (Join-Path $env:GITHUB_ACTION_PATH install.ps1) -StoreOnly'

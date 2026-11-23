@@ -1,6 +1,7 @@
 <#
 .SYNOPSIS
-Installs nova-nix for the current user on Windows, upgrades it, or removes it.
+Installs nova-nix for the current user on Windows, upgrades it, removes it, or
+sets up its store alone.
 
 .DESCRIPTION
 Downloads a nova-nix release archive and the release's SHA256SUMS, refuses an
@@ -17,6 +18,9 @@ The release to install, such as 0.10.0.0. The latest release by default.
 A directory holding a release's archive and SHA256SUMS, installed in place of a
 download.
 
+.PARAMETER StoreOnly
+Sets up C:\nix for the store, and installs nothing.
+
 .PARAMETER Uninstall
 Removes nova-nix and the user Path entry this script added. The store is kept.
 
@@ -32,6 +36,7 @@ powershell -c "& ([scriptblock]::Create((irm https://raw.githubusercontent.com/N
 param(
     [string]$Version = '',
     [string]$From = '',
+    [switch]$StoreOnly,
     [switch]$Uninstall,
     [switch]$RemoveStore
 )
@@ -837,6 +842,12 @@ function Test-SymlinkAllowed {
     return ($null -ne $unlock) -and ($unlock.AllowDevelopmentWithoutDevLicense -eq 1)
 }
 
+function Write-SymlinkWarning {
+    if (-not (Test-SymlinkAllowed)) {
+        Write-Warning 'nova-nix makes symbolic links, which Windows allows only in Developer Mode or an elevated shell. Turn on Developer Mode in Settings, under For developers, or building a path that holds a link fails.'
+    }
+}
+
 # ---------------------------------------------------------------------------
 # Install and uninstall
 # ---------------------------------------------------------------------------
@@ -881,9 +892,7 @@ function Install-NovaNix([string]$Version, [string]$From) {
             Remove-Tree -Path $scratch
         }
     }
-    if (-not (Test-SymlinkAllowed)) {
-        Write-Warning 'nova-nix makes symbolic links, which Windows allows only in Developer Mode or an elevated shell. Turn on Developer Mode in Settings, under For developers, or building a path that holds a link fails.'
-    }
+    Write-SymlinkWarning
     Write-Step "$reported is installed in $NovaNixRoot."
     Write-Step 'Open a new terminal to use it.'
 }
@@ -932,7 +941,7 @@ function Uninstall-NovaNix([switch]$RemoveStore) {
     }
 }
 
-function Invoke-NovaNixInstaller([string]$Version, [string]$From, [switch]$Uninstall, [switch]$RemoveStore) {
+function Invoke-NovaNixInstaller([string]$Version, [string]$From, [switch]$StoreOnly, [switch]$Uninstall, [switch]$RemoveStore) {
     $ErrorActionPreference = 'Stop'
     # Windows PowerShell redraws its progress bar for every chunk a download
     # writes, which slows the download many times over.
@@ -944,14 +953,15 @@ function Invoke-NovaNixInstaller([string]$Version, [string]$From, [switch]$Unins
     $sessionProtocols = [System.Net.ServicePointManager]::SecurityProtocol
     [System.Net.ServicePointManager]::SecurityProtocol = $sessionProtocols -bor [System.Net.SecurityProtocolType]::Tls12
     try {
-        Invoke-InstallerAction -Version $Version -From $From -Uninstall:$Uninstall -RemoveStore:$RemoveStore
+        Invoke-InstallerAction -Version $Version -From $From -StoreOnly:$StoreOnly -Uninstall:$Uninstall -RemoveStore:$RemoveStore
     } finally {
         [System.Net.ServicePointManager]::SecurityProtocol = $sessionProtocols
     }
 }
 
-# Checks the arguments and runs the install or the uninstall they ask for.
-function Invoke-InstallerAction([string]$Version, [string]$From, [switch]$Uninstall, [switch]$RemoveStore) {
+# Checks the arguments and runs the install, the store setup or the
+# uninstall they ask for.
+function Invoke-InstallerAction([string]$Version, [string]$From, [switch]$StoreOnly, [switch]$Uninstall, [switch]$RemoveStore) {
     if ($Version -eq 'latest') {
         $Version = ''
     }
@@ -967,11 +977,23 @@ function Invoke-InstallerAction([string]$Version, [string]$From, [switch]$Uninst
     if ($Uninstall -and ($From -or $Version)) {
         throw '-Uninstall takes no -Version or -From'
     }
+    if ($StoreOnly -and $Uninstall) {
+        throw '-StoreOnly and -Uninstall cannot be used together'
+    }
+    if ($StoreOnly -and ($From -or $Version)) {
+        throw '-StoreOnly takes no -Version or -From'
+    }
     if ($RemoveStore -and -not $Uninstall) {
         throw '-RemoveStore goes with -Uninstall'
     }
     if (-not [Environment]::Is64BitOperatingSystem) {
         throw 'nova-nix publishes no archive for 32-bit Windows'
+    }
+    # The store is all -StoreOnly sets up, so it needs no install folder.
+    if ($StoreOnly) {
+        Install-Store
+        Write-SymlinkWarning
+        return
     }
     if (-not $env:LOCALAPPDATA) {
         throw 'LOCALAPPDATA is not set, so there is no folder to install nova-nix in'
@@ -984,4 +1006,4 @@ function Invoke-InstallerAction([string]$Version, [string]$From, [switch]$Uninst
     }
 }
 
-Invoke-NovaNixInstaller -Version $Version -From $From -Uninstall:$Uninstall -RemoveStore:$RemoveStore
+Invoke-NovaNixInstaller -Version $Version -From $From -StoreOnly:$StoreOnly -Uninstall:$Uninstall -RemoveStore:$RemoveStore
