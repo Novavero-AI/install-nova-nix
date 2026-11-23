@@ -1,5 +1,6 @@
 #!/bin/sh
-# Install nova-nix for one user on Linux or macOS, upgrade it, or remove it.
+# Install nova-nix for one user on Linux or macOS, upgrade it, remove it, or
+# set up its store alone.
 #
 #   curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Novavero-AI/install-nova-nix/v1/install.sh | sh
 #
@@ -84,13 +85,15 @@ die() {
 
 usage() {
   cat <<'EOF'
-Install nova-nix for this user, or upgrade or remove it.
+Install nova-nix for this user, upgrade or remove it, or set up its store alone.
 
 Usage: install.sh [--version VERSION | --from DIR]
+       install.sh --store-only
        install.sh --uninstall [--remove-store]
 
   --version VERSION  install this release (for example 0.10.0.0), not the latest
   --from DIR         install the archive in DIR, checked against DIR/SHA256SUMS
+  --store-only       set up /nix for the store, and install nothing
   --uninstall        remove nova-nix and the PATH lines this script added
   --remove-store     with --uninstall, also remove /nix/store and its setup
   -h, --help         show this help
@@ -1098,20 +1101,26 @@ make_scratch() {
   scratch=$(mktemp -d "${HOME}/${install_dir}.XXXXXX") || die "could not create a directory in ${HOME}"
 }
 
+# Sets up the store where nova-nix looks for it, unless upstream Nix manages
+# it there, which is left alone.
+setup_store() {
+  if upstream_present; then
+    upstream_warning
+    return 0
+  fi
+  case ${os} in
+    linux) setup_store_linux ;;
+    macos) setup_store_macos ;;
+  esac
+}
+
 install_nova_nix() {
   check_root
   make_scratch
   fetch_release
   verify
   unpack
-  if upstream_present; then
-    upstream_warning
-  else
-    case ${os} in
-      linux) setup_store_linux ;;
-      macos) setup_store_macos ;;
-    esac
-  fi
+  setup_store
   place
   add_path_lines
   say "${reported} is installed in ${root}."
@@ -1191,7 +1200,13 @@ main() {
         [ -n "${from}" ] || usage_error "--from needs a directory"
         ;;
       --uninstall)
+        [ "${mode}" != store ] || usage_error "--store-only and --uninstall cannot be used together"
         mode=uninstall
+        shift
+        ;;
+      --store-only)
+        [ "${mode}" != uninstall ] || usage_error "--store-only and --uninstall cannot be used together"
+        mode=store
         shift
         ;;
       --remove-store)
@@ -1218,6 +1233,9 @@ main() {
   if [ "${mode}" = uninstall ] && { [ -n "${from}" ] || [ -n "${version}" ]; }; then
     usage_error "--uninstall takes no --version or --from"
   fi
+  if [ "${mode}" = store ] && { [ -n "${from}" ] || [ -n "${version}" ]; }; then
+    usage_error "--store-only takes no --version or --from"
+  fi
   if [ "${remove_store}" = yes ] && [ "${mode}" != uninstall ]; then
     usage_error "--remove-store goes with --uninstall"
   fi
@@ -1234,6 +1252,7 @@ main() {
   fi
   case ${mode} in
     install) install_nova_nix ;;
+    store) setup_store ;;
     uninstall) uninstall_nova_nix ;;
   esac
 }

@@ -166,6 +166,158 @@ jobs:
             Write-Error "expected '$expected', got '$got'"; exit 1
           }
 
+  # The action sets up the store where nova-nix looks for it, as the
+  # installers do on a machine, so the builds here pass no --store. A
+  # program from cache.nixos.org loads its libraries from /nix/store, so the
+  # substituted hello runs only from a store there.
+  store:
+    name: Build in the action's store (${{ matrix.os }})
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # The nixpkgs nova-nix's parity CI pins; cache.nixos.org holds its
+      # hello for both runners.
+      NIXPKGS_REV: 6f06d204d8f2d8761d9da78778745974a3216381
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - uses: ./
+        id: nova
+        with:
+          version: ${{ needs.version.outputs.version }}
+
+      # The installer sets up only the store here: no install in the home
+      # directory and no PATH line in a startup file.
+      - name: The action installed nothing outside RUNNER_TEMP (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        env:
+          BIN_DIR: ${{ steps.nova.outputs.bin-dir }}
+        run: |
+          set -euo pipefail
+          [ ! -e "${HOME}/.nova-nix" ] || { echo "the action installed into ${HOME}/.nova-nix" >&2; exit 1; }
+          for rc in "${HOME}/.profile" "${HOME}/.bash_profile" "${HOME}/.bash_login" "${HOME}/.bashrc" \
+            "${HOME}/.zshenv" "${HOME}/.config/fish/conf.d/nova-nix.fish"; do
+            if [ -e "${rc}" ] && grep -qF 'added by the nova-nix installer' "${rc}"; then
+              echo "the action put nova-nix on PATH in ${rc}" >&2
+              exit 1
+            fi
+          done
+          found=$(command -v nova-nix)
+          [ "${found}" = "${BIN_DIR}/nova-nix" ] || { echo "PATH finds ${found}, not ${BIN_DIR}/nova-nix" >&2; exit 1; }
+
+      - name: The action installed nothing outside RUNNER_TEMP (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:LOCALAPPDATA 'Programs\nova-nix'
+          if (Test-Path -LiteralPath $root) { Write-Error "the action installed into $root"; exit 1 }
+          $entries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ -like '*nova-nix*' })
+          if ($entries.Count -ne 0) { Write-Error "the action put $entries in the user Path"; exit 1 }
+
+      - name: /nix is the runner user's (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ "$(stat -c %U /nix)" = "$(id -un)" ] || { echo "/nix is not $(id -un)'s" >&2; exit 1; }
+
+      - name: /nix is the runner user's volume of its own (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          name=$(diskutil info -plist /nix | plutil -extract VolumeName raw -o - -)
+          [ "${name}" = 'nova-nix Store' ] || { echo "/nix is the volume '${name}'" >&2; exit 1; }
+          [ "$(stat -f %Su /nix)" = "$(id -un)" ] || { echo "/nix is not $(id -un)'s" >&2; exit 1; }
+
+      - name: Build a derivation with no --store (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2016 # The builder's shell expands $out.
+          out=$(nova-nix build --expr 'derivation { name = "greeting"; system = builtins.currentSystem; builder = "/bin/sh"; args = [ "-c" "echo hello > $out" ]; }' \
+            | tail -n1)
+          echo "built: ${out}"
+          case ${out} in
+            /nix/store/*-greeting) ;;
+            *) echo "not a path in /nix/store: ${out}" >&2; exit 1 ;;
+          esac
+          got=$(cat "${out}")
+          [ "${got}" = hello ] || { echo "${out} holds ${got}" >&2; exit 1; }
+
+      - name: Substitute GNU Hello with no --store, and run it (Linux, macOS)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://github.com/NixOS/nixpkgs/archive/${NIXPKGS_REV}.tar.gz" | tar -xz
+          out=$(nova-nix build --expr "(import ./nixpkgs-${NIXPKGS_REV} { }).hello" \
+            --substituter https://cache.nixos.org \
+            --trusted-key cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= \
+            | tail -n1)
+          echo "substituted: ${out}"
+          case ${out} in
+            /nix/store/*-hello-*) ;;
+            *) echo "not a path in /nix/store: ${out}" >&2; exit 1 ;;
+          esac
+          got=$("${out}/bin/hello")
+          [ "${got}" = 'Hello, world!' ] || { echo "hello printed ${got}" >&2; exit 1; }
+
+      - name: Build GNU Hello with no --store, and run it (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          LC_ALL: C
+          BIN_DIR: ${{ steps.nova.outputs.bin-dir }}
+        run: |
+          $recipe = (Resolve-Path -LiteralPath (Join-Path $env:BIN_DIR '..\pkgs\windows\hello.nix')).Path
+          $out = nova-nix build $recipe `
+            --substituter https://cache.novavero.ai `
+            --trusted-key cache.novavero.ai-1:9gQ7tLWMM+2tdC9H5sKMJltDIPfD7X2GWlZe8Aa8hHQ= |
+            Select-Object -Last 1
+          if ($LASTEXITCODE -ne 0) { Write-Error "nova-nix build failed with exit code $LASTEXITCODE"; exit 1 }
+          Write-Host "built: $out"
+          if (-not "$out".StartsWith('C:\nix\store\', [System.StringComparison]::OrdinalIgnoreCase)) {
+            Write-Error "not a path in C:\nix\store: $out"; exit 1
+          }
+          $got = (& (Join-Path $out 'bin\hello.exe')) -join "`n"
+          if ($LASTEXITCODE -ne 0) { Write-Error "hello failed with exit code $LASTEXITCODE"; exit 1 }
+          if ($got -cne 'Hello, world!') { Write-Error "hello printed '$got'"; exit 1 }
+          Add-Content -LiteralPath $env:GITHUB_ENV -Value "out=$out"
+
+      # C:\nix as the installer makes it, protected from C:\'s grants, and
+      # the store and the build in it inheriting that.
+      - name: Only this user, SYSTEM and Administrators can change the store (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $writes = [int][System.Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteExtendedAttributes, DeleteSubdirectoriesAndFiles, WriteAttributes, Delete, ChangePermissions, TakeOwnership'
+          $generic = 0x10000000 -bor 0x40000000
+          $allowed = @(
+            [System.Security.Principal.WindowsIdentity]::GetCurrent().User.Value,
+            'S-1-5-18',
+            'S-1-5-32-544'
+          )
+          if (-not (Get-Acl -LiteralPath 'C:\nix').AreAccessRulesProtected) { Write-Error 'C:\nix inherits from C:\'; exit 1 }
+          foreach ($path in 'C:\nix', 'C:\nix\store', $env:out) {
+            icacls $path
+            $acl = Get-Acl -LiteralPath $path
+            $owner = $acl.GetOwner([System.Security.Principal.SecurityIdentifier]).Value
+            if ($allowed -notcontains $owner) { Write-Error "$path belongs to $owner"; exit 1 }
+            foreach ($rule in $acl.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])) {
+              $rights = [int]$rule.FileSystemRights
+              if ($rule.AccessControlType -eq 'Allow' -and ($rights -band ($writes -bor $generic)) -and $allowed -notcontains $rule.IdentityReference.Value) {
+                Write-Error "$path lets $($rule.IdentityReference.Value) change it ($($rule.FileSystemRights))"; exit 1
+              }
+            }
+          }
+
   pinned:
     name: Install a pinned version
     runs-on: ubuntu-latest
@@ -198,7 +350,7 @@ jobs:
         with:
           version: 0/../../../../../octocat/Hello-World/releases/download/v1
 
-      - name: The action refused it before downloading
+      - name: The action refused it before downloading or setting up the store
         shell: bash
         env:
           OUTCOME: ${{ steps.nova.outcome }}
@@ -207,6 +359,34 @@ jobs:
           set -euo pipefail
           [ "$OUTCOME" = failure ] || { echo "expected failure, got $OUTCOME" >&2; exit 1; }
           [ -z "$BIN_DIR" ] || { echo "installed into $BIN_DIR" >&2; exit 1; }
+          [ ! -e /nix ] || { echo "set up /nix before refusing" >&2; exit 1; }
+
+  # The action's store setup makes the installer's checks: a /nix of root's
+  # that holds something is not the runner user's to take. The action
+  # fails after installing, so bin-dir is set, and /nix is left as it was.
+  refused-store:
+    name: Refuse a store that is not the runner user's
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Make /nix root's, holding something
+        run: sudo mkdir -p /nix/someone-else
+
+      - uses: ./
+        id: nova
+        continue-on-error: true
+
+      - name: The action refused the store and left it as it was
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.nova.outcome }}
+          BIN_DIR: ${{ steps.nova.outputs.bin-dir }}
+        run: |
+          set -euo pipefail
+          [ "$OUTCOME" = failure ] || { echo "expected failure, got $OUTCOME" >&2; exit 1; }
+          [ -n "$BIN_DIR" ] || { echo "the action failed before installing, not at the store" >&2; exit 1; }
+          [ "$(stat -c %U /nix)" = root ] && [ -d /nix/someone-else ] || { echo "/nix changed" >&2; exit 1; }
 
   # shellcheck reads install.sh as the POSIX sh it is written in, and
   # PSScriptAnalyzer checks install.ps1 against the commands and types of
@@ -295,6 +475,25 @@ jobs:
             echo "RELEASE_ARCHIVE=${archive}"
             echo "RELEASE_DIR=${dir}"
           } >> "${GITHUB_ENV}"
+
+      # Refused before anything changes, so /nix is still not there.
+      - name: --store-only takes no release and no uninstall
+        run: |
+          set -euo pipefail
+          check() {
+            expected=$1
+            shift
+            status=0
+            sh install.sh "$@" 2> refusal || status=$?
+            cat refusal
+            [ "${status}" -eq 2 ] || { echo "install.sh $* exited ${status}, not 2" >&2; exit 1; }
+            grep -qF -- "${expected}" refusal || { echo "install.sh $* refused for another reason" >&2; exit 1; }
+          }
+          check '--store-only takes no --version or --from' --store-only --version "${RELEASE}"
+          check '--store-only takes no --version or --from' --store-only --from "${RELEASE_DIR}"
+          check '--store-only and --uninstall cannot be used together' --store-only --uninstall
+          check '--store-only and --uninstall cannot be used together' --uninstall --store-only
+          [ ! -e /nix ] || { echo "/nix was made before refusing" >&2; exit 1; }
 
       - name: Install ${{ env.UPGRADE_FROM }}
         run: |
@@ -548,7 +747,8 @@ jobs:
           sudo rm -r /nix
 
       # A /nix of root's is taken over only when it is empty; one holding
-      # anything, or one that is a link, is refused and left as it was.
+      # anything, or one that is a link, is refused and left as it was, by
+      # --store-only as by an install.
       - name: A /nix of root's is taken over only when empty (Linux)
         if: runner.os == 'Linux'
         run: |
@@ -561,9 +761,10 @@ jobs:
           sh install.sh --uninstall --remove-store
           [ ! -e /nix ] || { echo "/nix is still there" >&2; exit 1; }
           sudo mkdir -p /nix/someone-else
-          for action in install rerun uninstall; do
+          for action in install rerun store-only uninstall; do
             case ${action} in
               install | rerun) set -- --from "${RELEASE_DIR}" ;;
+              store-only) set -- --store-only ;;
               uninstall) set -- --uninstall --remove-store ;;
             esac
             if sh install.sh "$@" 2> refusal; then echo "${action} went ahead over a /nix holding something" >&2; exit 1; fi
@@ -581,9 +782,9 @@ jobs:
       # The volume's own root decides whose the store is: read on a private
       # mount point when the volume is not mounted, taken over when it is
       # root's and holds only what macOS makes there itself (the volume being
-      # of the installer's record), and refused, on every run and on
-      # uninstall, when it is root's and holds anything else. Nothing is left
-      # mounted under /private/tmp.
+      # of the installer's record), and refused, on every run, --store-only
+      # and uninstall among them, when it is root's and holds anything else.
+      # Nothing is left mounted under /private/tmp.
       - name: Whose the store volume is (macOS)
         if: runner.os == 'macOS'
         run: |
@@ -631,8 +832,12 @@ jobs:
           sudo chown "$(id -u):$(id -g)" /nix
           sudo mkdir /nix/someone-else
           sudo chown 0:0 /nix
-          for action in install rerun; do
-            if sh install.sh --from "${RELEASE_DIR}" 2> refusal; then echo "${action} went ahead over a root holding something" >&2; exit 1; fi
+          for action in install rerun store-only; do
+            case ${action} in
+              install | rerun) set -- --from "${RELEASE_DIR}" ;;
+              store-only) set -- --store-only ;;
+            esac
+            if sh install.sh "$@" 2> refusal; then echo "${action} went ahead over a root holding something" >&2; exit 1; fi
             cat refusal
             grep -q 'belongs to uid 0 and is not empty' refusal
           done
@@ -716,6 +921,25 @@ jobs:
           Invoke-WebRequest -Uri "$base/nova-nix-windows-x64.zip" -OutFile (Join-Path $dir 'nova-nix-windows-x64.zip')
           Invoke-WebRequest -Uri "$base/SHA256SUMS" -OutFile (Join-Path $dir 'SHA256SUMS')
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "RELEASE_DIR=$dir"
+
+      # Refused before anything changes, so C:\nix is still not there.
+      - name: -StoreOnly takes no release and no uninstall
+        run: |
+          $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))
+          $cases = @(
+            @{ Expected = '-StoreOnly takes no -Version or -From'; Arguments = @{ StoreOnly = $true; Version = $env:RELEASE } },
+            @{ Expected = '-StoreOnly takes no -Version or -From'; Arguments = @{ StoreOnly = $true; From = $env:RELEASE_DIR } },
+            @{ Expected = '-StoreOnly and -Uninstall cannot be used together'; Arguments = @{ StoreOnly = $true; Uninstall = $true } }
+          )
+          foreach ($case in $cases) {
+            $arguments = $case.Arguments
+            $refusal = $null
+            try { & $installer @arguments } catch { $refusal = $_.Exception.Message }
+            if ($null -eq $refusal) { throw "went ahead with $($arguments.Keys -join ', ')" }
+            Write-Host "refused: $refusal"
+            if ($refusal -notlike "*$($case.Expected)*") { throw "refused for another reason: $refusal" }
+          }
+          if (Test-Path -LiteralPath 'C:\nix') { throw 'C:\nix was made before refusing' }
 
       - name: Install ${{ env.UPGRADE_FROM }}
         run: |
@@ -824,8 +1048,8 @@ jobs:
 
       # A C:\nix left with an extra entry, as one made before the installer
       # would be, and an entry below it that another account can change:
-      # install refuses before writing C:\nix's DACL, a rerun refuses again,
-      # and -RemoveStore removes nothing.
+      # install refuses before writing C:\nix's DACL, a rerun and -StoreOnly
+      # refuse again, and -RemoveStore removes nothing.
       - name: A store another account can change is refused on every run
         run: |
           $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))
@@ -834,7 +1058,7 @@ jobs:
           icacls $probe /grant '*S-1-1-0:(OI)(CI)M' | Out-Null
           icacls 'C:\nix' /grant '*S-1-1-0:(OI)(CI)RX' | Out-Null
           $before = (icacls 'C:\nix') -join "`n"
-          foreach ($arguments in @(@{ From = $env:RELEASE_DIR }, @{ From = $env:RELEASE_DIR }, @{ Uninstall = $true; RemoveStore = $true })) {
+          foreach ($arguments in @(@{ From = $env:RELEASE_DIR }, @{ From = $env:RELEASE_DIR }, @{ StoreOnly = $true }, @{ Uninstall = $true; RemoveStore = $true })) {
             $refusal = $null
             try { & $installer @arguments } catch { $refusal = $_.Exception.Message }
             if ($null -eq $refusal) { throw "went ahead with $($arguments.Keys -join ', ') over an entry another account can change" }

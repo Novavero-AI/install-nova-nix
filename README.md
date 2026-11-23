@@ -6,8 +6,8 @@
 
 Install [nova-nix](https://github.com/Novavero-AI/nova-nix) on a machine, or in
 a GitHub Actions workflow. Both download a release archive, check it against
-the release's published checksums and put it on `PATH`; on a machine, the
-installer also sets up the store. No Haskell toolchain is needed.
+the release's published checksums, put it on `PATH` and set up the store. No
+Haskell toolchain is needed.
 
 For what to do with nova-nix once it is installed, see
 [its README](https://github.com/Novavero-AI/nova-nix#readme).
@@ -89,6 +89,7 @@ curl --proto '=https' --tlsv1.2 -fsSL https://raw.githubusercontent.com/Novavero
 | --- | --- | --- |
 | `--version VERSION` | `-Version VERSION` | Installs this release rather than the latest. |
 | `--from DIR` | `-From DIR` | Installs the archive in `DIR`, checked against `DIR`'s `SHA256SUMS`, rather than downloading it. |
+| `--store-only` | `-StoreOnly` | Sets up the store and installs nothing. |
 | `--uninstall` | `-Uninstall` | Removes nova-nix and the `PATH` entries the installer added. The store stays. |
 | `--remove-store` | `-RemoveStore` | With uninstall, removes the store and what the installer set up for it. |
 
@@ -108,8 +109,10 @@ steps:
   - run: nova-nix eval --expr '1 + 2'
 ```
 
-The action sets up no store, so on a Linux or macOS runner a command that
-writes to the store needs `--store`.
+The action sets up [the store](#the-store) as the installer does on a machine,
+with the same checks, so a command needs `--store` only where upstream Nix
+manages `/nix/store`. On Linux and macOS that needs `sudo` without a password,
+as GitHub's hosted runners have, unless `/nix` is already yours.
 
 ### Inputs
 
@@ -177,7 +180,9 @@ jobs:
 A composite action: the steps run directly in your job, on your runner, with no
 Node bundle to build or audit. It resolves the platform, downloads the matching
 archive and the release's `SHA256SUMS`, verifies the archive against it,
-unpacks it under `RUNNER_TEMP`, and appends `bin/` to `GITHUB_PATH`.
+unpacks it under `RUNNER_TEMP`, and appends `bin/` to `GITHUB_PATH`. Then it
+sets up the store with the installer at the same ref, `install.sh --store-only`,
+or `install.ps1 -StoreOnly` on Windows.
 
 ## Platform support
 
