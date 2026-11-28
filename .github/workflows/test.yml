@@ -107,6 +107,33 @@ jobs:
           $got = nova-nix eval --expr '1 + 2'
           if ($got -ne '3') { Write-Error "expected 3, got $got"; exit 1 }
 
+      # The profile's bin goes on PATH ahead of nova-nix's, so a program in
+      # it runs in place of one of the same name elsewhere: here a nova-nix,
+      # which runs in place of the one the action installed.  The profile is
+      # made by hand and taken away again.
+      - name: The profile's bin comes first on PATH
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${RUNNER_OS}" = Windows ]; then home=$(cygpath -u "${USERPROFILE}"); else home=${HOME}; fi
+          mkdir -p "${home}/.nix-profile/bin"
+          printf '#!/bin/sh\necho from the profile\n' > "${home}/.nix-profile/bin/nova-nix"
+          chmod +x "${home}/.nix-profile/bin/nova-nix"
+          got=$(nova-nix)
+          rm -r "${home}/.nix-profile"
+          [ "${got}" = 'from the profile' ] || { echo "expected the profile's nova-nix, got ${got}" >&2; exit 1; }
+
+      - name: The profile's bin comes first on PATH outside bash (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $profileDir = Join-Path $env:USERPROFILE '.nix-profile'
+          [void](New-Item -ItemType Directory -Force -Path (Join-Path $profileDir 'bin'))
+          Set-Content -LiteralPath (Join-Path $profileDir 'bin\nova-nix.cmd') -Value '@echo from the profile'
+          $got = nova-nix
+          Remove-Item -LiteralPath $profileDir -Recurse
+          if ($got -ne 'from the profile') { Write-Error "expected the profile's nova-nix, got $got"; exit 1 }
+
   # Installing and evaluating is not the same as building, and building is
   # most of what someone installs this to do.  The archive carries share/ so
   # <nix/*> resolves and pkgs/ so there is something to build, and this job
@@ -216,7 +243,7 @@ jobs:
         run: |
           $root = Join-Path $env:LOCALAPPDATA 'Programs\nova-nix'
           if (Test-Path -LiteralPath $root) { Write-Error "the action installed into $root"; exit 1 }
-          $entries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ -like '*nova-nix*' })
+          $entries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ -like '*nova-nix*' -or $_ -like '*.nix-profile*' })
           if ($entries.Count -ne 0) { Write-Error "the action put $entries in the user Path"; exit 1 }
 
       - name: /nix is the runner user's (Linux)
@@ -595,6 +622,42 @@ jobs:
           [ "${got}" = 'Hello, world!' ] || { echo "hello printed ${got}" >&2; exit 1; }
           echo "out=${out}" >> "${GITHUB_ENV}"
 
+      # A profile links its packages' programs from ~/.nix-profile/bin, which
+      # every shell finds ahead of nova-nix's bin/. The profile is made by
+      # hand, so the release under test need not keep one: the hello built
+      # above, and a nova-nix that runs in place of the installed one. It is
+      # taken away again.
+      - name: Every shell runs a program the profile holds, ahead of nova-nix's bin
+        run: |
+          set -euo pipefail
+          profile="${RUNNER_TEMP}/profile"
+          mkdir -p "${profile}/bin"
+          ln -s "${out}/bin/hello" "${profile}/bin/hello"
+          printf '#!/bin/sh\necho from the profile\n' > "${profile}/bin/nova-nix"
+          chmod +x "${profile}/bin/nova-nix"
+          ln -s "${profile}" "${HOME}/.nix-profile"
+          expect="${HOME}/.nix-profile/bin/hello
+          Hello, world!
+          from the profile"
+          failed=
+          check() {
+            got=$(env -i HOME="${HOME}" PATH=/usr/bin:/bin "$@" 'command -v hello; hello; nova-nix')
+            if [ "${got}" != "${expect}" ]; then
+              printf '%s found:\n%s\nexpected:\n%s\n' "$*" "${got}" "${expect}" >&2
+              failed=yes
+              return 0
+            fi
+            echo "$*: ok"
+          }
+          check sh -lc
+          check bash -lc
+          if [ -f "${HOME}/.bashrc" ]; then check bash -ic; fi
+          if command -v zsh >/dev/null; then check zsh -c; fi
+          if command -v fish >/dev/null; then check fish -c; fi
+          rm "${HOME}/.nix-profile"
+          rm -r "${profile}"
+          [ -z "${failed}" ]
+
       # Another account on the same machine: its install and its uninstall
       # both find /nix is this user's, refuse it, and change none of it.
       - name: A second user cannot take the store
@@ -656,6 +719,27 @@ jobs:
           got=$(env -i HOME="${HOME}" PATH=/usr/bin:/bin sh -lc 'nova-nix --version')
           [ "${got}" = "nova-nix ${RELEASE}" ] || { echo "the install became ${got}" >&2; exit 1; }
 
+      # Every install since the first found both lines in place and added
+      # neither again.
+      - name: Each startup file holds each line once
+        run: |
+          set -euo pipefail
+          checked=
+          for rc in "${HOME}/.profile" "${HOME}/.bash_profile" "${HOME}/.bash_login" "${HOME}/.bashrc" \
+            "${HOME}/.zshenv" "${HOME}/.config/fish/conf.d/nova-nix.fish"; do
+            if [ ! -e "${rc}" ] || ! grep -qF 'added by the nova-nix installer' "${rc}"; then continue; fi
+            for dir in .nova-nix/bin .nix-profile/bin; do
+              count=$(grep -F 'added by the nova-nix installer' "${rc}" | grep -cF "/${dir}") || :
+              [ "${count}" -eq 1 ] || { echo "${rc} puts ${dir} on PATH ${count} times" >&2; exit 1; }
+            done
+            checked="${checked} ${rc}"
+            echo "${rc}: ok"
+          done
+          case " ${checked} " in
+            *" ${HOME}/.profile "*) ;;
+            *) echo "${HOME}/.profile puts nothing on PATH" >&2; exit 1 ;;
+          esac
+
       - name: Uninstall, keeping the store
         run: |
           set -euo pipefail
@@ -677,27 +761,28 @@ jobs:
             fi
           done
           [ -z "${left}" ] || { echo "still names nova-nix:${left}" >&2; exit 1; }
-          bin="${HOME}/.nova-nix/bin"
           shells=("sh -lc" "bash -lc")
           if [ -f "${HOME}/.bashrc" ]; then shells+=("bash -ic"); fi
           if command -v zsh >/dev/null; then shells+=("zsh -c"); fi
-          for s in "${shells[@]}"; do
-            read -r -a invocation <<< "${s}"
-            # shellcheck disable=SC2016 # The new shell expands its own PATH.
-            path=$(env -i HOME="${HOME}" PATH=/usr/bin:/bin "${invocation[@]}" 'printf %s "${PATH}"')
-            case ":${path}:" in
-              *":${bin}:"*) echo "${s} still puts ${bin} on PATH: ${path}" >&2; exit 1 ;;
-            esac
-            echo "${s}: ok"
+          for bin in "${HOME}/.nova-nix/bin" "${HOME}/.nix-profile/bin"; do
+            for s in "${shells[@]}"; do
+              read -r -a invocation <<< "${s}"
+              # shellcheck disable=SC2016 # The new shell expands its own PATH.
+              path=$(env -i HOME="${HOME}" PATH=/usr/bin:/bin "${invocation[@]}" 'printf %s "${PATH}"')
+              case ":${path}:" in
+                *":${bin}:"*) echo "${s} still puts ${bin} on PATH: ${path}" >&2; exit 1 ;;
+              esac
+              echo "${s}, ${bin}: ok"
+            done
+            if command -v fish >/dev/null; then
+              # shellcheck disable=SC2016 # fish expands its own PATH.
+              path=$(env -i HOME="${HOME}" PATH=/usr/bin:/bin fish -c 'string join : $PATH')
+              case ":${path}:" in
+                *":${bin}:"*) echo "fish still puts ${bin} on PATH: ${path}" >&2; exit 1 ;;
+              esac
+              echo "fish -c, ${bin}: ok"
+            fi
           done
-          if command -v fish >/dev/null; then
-            # shellcheck disable=SC2016 # fish expands its own PATH.
-            path=$(env -i HOME="${HOME}" PATH=/usr/bin:/bin fish -c 'string join : $PATH')
-            case ":${path}:" in
-              *":${bin}:"*) echo "fish still puts ${bin} on PATH: ${path}" >&2; exit 1 ;;
-            esac
-            echo "fish -c: ok"
-          fi
 
       - name: Uninstall the store too
         run: |
@@ -975,6 +1060,23 @@ jobs:
           $got = nova-nix --version
           if ($got -cne "nova-nix $env:RELEASE") { Write-Error "expected nova-nix $env:RELEASE, got $got"; exit 1 }
 
+      # The profile's entry is in the user Path as the registry holds it,
+      # with %USERPROFILE% unexpanded, ahead of nova-nix's, and each install
+      # since the first found it there and added it no second time.
+      - name: The user Path puts the profile's bin ahead, once
+        shell: pwsh
+        run: |
+          $key = [Microsoft.Win32.Registry]::CurrentUser.OpenSubKey('Environment')
+          $raw = @([string]$key.GetValue('Path', '', [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) -split ';')
+          $key.Close()
+          $profileBin = '%USERPROFILE%\.nix-profile\bin'
+          $count = @($raw | Where-Object { $_ -eq $profileBin }).Count
+          if ($count -ne 1) { Write-Error "the user Path holds $profileBin $count times: $($raw -join ';')"; exit 1 }
+          $novaBin = Join-Path $env:LOCALAPPDATA 'Programs\nova-nix\bin'
+          if ([array]::IndexOf($raw, $profileBin) -ge [array]::IndexOf($raw, $novaBin)) {
+            Write-Error "the user Path does not put $profileBin ahead of ${novaBin}: $($raw -join ';')"; exit 1
+          }
+
       - name: Build GNU Hello with no --store
         shell: pwsh
         env:
@@ -995,6 +1097,27 @@ jobs:
           if ($LASTEXITCODE -ne 0) { Write-Error "hello failed with exit code $LASTEXITCODE"; exit 1 }
           if ($got -cne 'Hello, world!') { Write-Error "hello printed '$got'"; exit 1 }
           Add-Content -LiteralPath $env:GITHUB_ENV -Value "out=$out"
+
+      # A profile links its packages' programs from %USERPROFILE%\.nix-profile\bin,
+      # which a new terminal finds through the user Path. The profile is made
+      # by hand, a link to the hello built above, so the release under test
+      # need not keep one, and is taken away again.
+      - name: A new terminal runs a program the profile holds
+        shell: pwsh
+        run: |
+          $link = Join-Path $env:USERPROFILE '.nix-profile'
+          [void](New-Item -ItemType SymbolicLink -Path $link -Target $env:out)
+          try {
+            $env:Path = [Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [Environment]::GetEnvironmentVariable('Path', 'User')
+            $found = (Get-Command hello).Source
+            $expected = Join-Path $link 'bin\hello.exe'
+            if ($found -ne $expected) { Write-Error "found $found, not $expected"; exit 1 }
+            $got = (& hello) -join "`n"
+            if ($LASTEXITCODE -ne 0) { Write-Error "hello failed with exit code $LASTEXITCODE"; exit 1 }
+            if ($got -cne 'Hello, world!') { Write-Error "hello printed '$got'"; exit 1 }
+          } finally {
+            (Get-Item -LiteralPath $link -Force).Delete()
+          }
 
       # No entry inherited from C:\, where every signed-in user may modify:
       # only this user, SYSTEM and Administrators own or can change the store
@@ -1177,7 +1300,7 @@ jobs:
         run: |
           $root = Join-Path $env:LOCALAPPDATA 'Programs\nova-nix'
           if (Test-Path -LiteralPath $root) { Write-Error "$root is still there"; exit 1 }
-          $entries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ -like '*nova-nix*' })
+          $entries = @([Environment]::GetEnvironmentVariable('Path', 'User') -split ';' | Where-Object { $_ -like '*nova-nix*' -or $_ -like '*.nix-profile*' })
           if ($entries.Count -ne 0) { Write-Error "the user Path still holds $entries"; exit 1 }
           if (-not (Test-Path -LiteralPath (Join-Path $env:out 'bin\hello.exe'))) { Write-Error 'the store went with it'; exit 1 }
 

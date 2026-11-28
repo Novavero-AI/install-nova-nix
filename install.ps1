@@ -7,7 +7,9 @@ sets up its store alone.
 Downloads a nova-nix release archive and the release's SHA256SUMS, refuses an
 archive that does not match, sets up C:\nix for the store, unpacks the archive
 into %LOCALAPPDATA%\Programs\nova-nix and adds its bin directory to the user
-Path. Run it again to upgrade: the install is replaced by the release it names.
+Path, with the bin directory of nova-nix's default profile,
+%USERPROFILE%\.nix-profile, ahead of it. Run it again to upgrade: the install
+is replaced by the release it names.
 
 Runs in Windows PowerShell 5.1 and PowerShell 7.
 
@@ -22,7 +24,7 @@ download.
 Sets up C:\nix for the store, and installs nothing.
 
 .PARAMETER Uninstall
-Removes nova-nix and the user Path entry this script added. The store is kept.
+Removes nova-nix and the user Path entries this script added. The store is kept.
 
 .PARAMETER RemoveStore
 With -Uninstall, also removes the store in C:\nix\store.
@@ -54,6 +56,11 @@ $NovaNixRoot = $null
 if ($env:LOCALAPPDATA) {
     $NovaNixRoot = [System.IO.Path]::GetFullPath("$env:LOCALAPPDATA\Programs\nova-nix")
 }
+# The profile nova-nix keeps for this user links the programs of the packages
+# added to it from this folder. It goes in the user Path as this reference,
+# unexpanded, so it follows the user's profile folder, and ahead of everything
+# there, nova-nix's own bin included, as upstream Nix puts a profile first.
+$NovaNixProfileBin = '%USERPROFILE%\.nix-profile\bin'
 # nova-nix keeps its store in C:\nix\store whatever the system drive is, and
 # only its --store option moves it.
 $NovaNixStoreRoot = 'C:\nix'
@@ -570,20 +577,47 @@ function Write-UserPath([string]$Value) {
     Send-SettingChange
 }
 
-# Puts the directory first in the user Path, and in this session's, unless
-# it is there already. The rest of the user Path is kept as it is.
+# Puts the directory first in the user Path, as given, and in this session's,
+# with any %VARIABLE% in it expanded, unless it is there already: in the user
+# Path, an entry that names it once both are expanded. The rest of the user
+# Path is kept as it is.
 function Add-UserPath([string]$Directory) {
     $current = Read-UserPath
-    if (@($current -split ';') -contains $Directory) {
+    $expanded = [Environment]::ExpandEnvironmentVariables($Directory)
+    $present = @($current -split ';' | Where-Object { [Environment]::ExpandEnvironmentVariables($_) -eq $expanded })
+    if ($present.Count -gt 0) {
         Write-Step "$Directory is already in your user Path"
     } else {
         $updated = if ($current) { "$Directory;$current" } else { $Directory }
         Write-UserPath $updated
         Write-Step "Added $Directory to your user Path"
     }
-    if (-not (@($env:Path -split ';') -contains $Directory)) {
-        $env:Path = "$Directory;$env:Path"
+    if (-not (@($env:Path -split ';') -contains $expanded)) {
+        $env:Path = "$expanded;$env:Path"
     }
+}
+
+# Takes the entries the installer added out of the user Path, each as it was
+# given, and out of this session's, expanded. The rest is kept as it is.
+function Remove-UserPath {
+    [CmdletBinding(SupportsShouldProcess)]
+    param([Parameter(Mandatory)][string[]]$Directories)
+
+    if (-not $PSCmdlet.ShouldProcess(($Directories -join ';'), 'Remove from the user Path')) {
+        return
+    }
+    $entries = @((Read-UserPath) -split ';')
+    $kept = @($entries | Where-Object { $Directories -notcontains $_ })
+    if ($kept.Count -ne $entries.Count) {
+        Write-UserPath ($kept -join ';')
+        foreach ($directory in $Directories) {
+            if ($entries -contains $directory) {
+                Write-Step "Removed $directory from your user Path"
+            }
+        }
+    }
+    $expanded = @($Directories | ForEach-Object { [Environment]::ExpandEnvironmentVariables($_) })
+    $env:Path = (@($env:Path -split ';') | Where-Object { $expanded -notcontains $_ }) -join ';'
 }
 
 # ---------------------------------------------------------------------------
@@ -886,7 +920,9 @@ function Install-NovaNix([string]$Version, [string]$From) {
 
         Install-Store
         Move-Install -Staged $staged
+        # The profile's entry is put first after nova-nix's, so it is ahead.
         Add-UserPath (Join-Path $NovaNixRoot 'bin')
+        Add-UserPath $NovaNixProfileBin
     } finally {
         if (Test-Path -LiteralPath $scratch) {
             Remove-Tree -Path $scratch
@@ -904,14 +940,7 @@ function Uninstall-NovaNix([switch]$RemoveStore) {
     if ($RemoveStore) {
         Assert-StoreRemovable
     }
-    $bin = Join-Path $NovaNixRoot 'bin'
-    $entries = @((Read-UserPath) -split ';')
-    $kept = @($entries | Where-Object { $_ -ne $bin })
-    if ($kept.Count -ne $entries.Count) {
-        Write-UserPath ($kept -join ';')
-        Write-Step "Removed $bin from your user Path"
-    }
-    $env:Path = (@($env:Path -split ';') | Where-Object { $_ -ne $bin }) -join ';'
+    Remove-UserPath -Directories @((Join-Path $NovaNixRoot 'bin'), $NovaNixProfileBin)
 
     if (Test-Path -LiteralPath $NovaNixRoot) {
         Remove-Tree -Path $NovaNixRoot
