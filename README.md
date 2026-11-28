@@ -66,7 +66,9 @@ a store volume this installer recorded, when it is root's and holds only
 entries macOS makes there itself, which are left as they are. On Windows, `C:\nix` and everything
 in it must belong to you, SYSTEM or Administrators and grant no other account
 a change, whether directly or inherited from `C:\`; read and execute for
-Users is fine. A store that is not, or whose owner cannot be read, is left
+Users is fine, and so is the right nova-nix gives its build accounts' local
+group, `nixbld`, to create entries in `C:\nix\store` and nothing else, by an
+entry on that directory alone. A store that is not, or whose owner cannot be read, is left
 alone, and the installer stops before changing anything. A `C:\nix` that
 nova-nix made itself still carries the drive root's grant of modify to every
 signed-in user, so it is refused too: move it aside, and the installer makes

@@ -66,6 +66,14 @@ $NovaNixProfileBin = '%USERPROFILE%\.nix-profile\bin'
 $NovaNixStoreRoot = 'C:\nix'
 $NovaNixStore = 'C:\nix\store'
 $NovaNixStoreInheritance = [System.Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+# The local group nova-nix's build accounts are in, and the rights nova-nix
+# gives it on the store directory alone, applying to that directory itself:
+# FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_TRAVERSE, FILE_READ_ATTRIBUTES
+# and SYNCHRONIZE, to create entries there and nothing else.
+$NovaNixBuildersGroup = 'nixbld'
+$NovaNixBuildersCreate = 0x1000A6
+# The flags of an entry that passes to what a directory holds.
+$NovaNixPassingDown = [int][System.Security.AccessControl.AceFlags]'ObjectInherit, ContainerInherit, InheritOnly'
 $FileAttributeDirectory = 0x10
 $FileAttributeReparsePoint = 0x400
 
@@ -221,6 +229,10 @@ namespace NovaNix
         private const int NotSupported = 50;
         private const int FileNotFound = 2;
         private const int PathNotFound = 3;
+        private const int NoneMapped = 1332;
+        private const int AliasSidType = 4;
+        private const int MaxComputerName = 15;
+        private const int MaxSidSize = 68;
         private const string LongPathPrefix = @"\\?\";
 
         [StructLayout(LayoutKind.Sequential)]
@@ -281,6 +293,12 @@ namespace NovaNix
 
         [DllImport("kernel32.dll")]
         private static extern IntPtr LocalFree(IntPtr memory);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool GetComputerNameW(char[] name, ref uint size);
+
+        [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool LookupAccountNameW(string system, string account, byte[] sid, ref uint sidSize, char[] domain, ref uint domainSize, out int use);
 
         private static SafeFileHandle Open(string path, uint access, out int error)
         {
@@ -401,6 +419,35 @@ namespace NovaNix
                     throw new InvalidOperationException(path + " could not be removed (Windows error " + Marshal.GetLastWin32Error() + ")");
                 }
             }
+        }
+
+        // The SID, in binary form, of this machine's local group of the name,
+        // or null where it has no local group of that name: none at all, or
+        // an account of another kind. The name is qualified by the
+        // computer's, so no domain's account answers for it.
+        public static byte[] LocalGroupSid(string name)
+        {
+            char[] computer = new char[MaxComputerName + 1];
+            uint computerSize = (uint)computer.Length;
+            if (!GetComputerNameW(computer, ref computerSize))
+            {
+                throw new InvalidOperationException("the computer's name cannot be read (Windows error " + Marshal.GetLastWin32Error() + ")");
+            }
+            byte[] sid = new byte[MaxSidSize];
+            uint sidSize = (uint)sid.Length;
+            char[] domain = new char[MaxComputerName + 1];
+            uint domainSize = (uint)domain.Length;
+            int use;
+            if (!LookupAccountNameW(null, new string(computer, 0, (int)computerSize) + "\\" + name, sid, ref sidSize, domain, ref domainSize, out use))
+            {
+                int error = Marshal.GetLastWin32Error();
+                if (error == NoneMapped)
+                {
+                    return null;
+                }
+                throw new InvalidOperationException("the group " + name + " cannot be looked up (Windows error " + error + ")");
+            }
+            return use == AliasSidType ? sid : null;
         }
 
         // Writes dacl, protected, to the directory at path through a handle
@@ -673,6 +720,17 @@ function Get-TrustedSid {
     return @($sids.User.Value, $sids.System.Value, $sids.Administrators.Value)
 }
 
+# The SID of nova-nix's build accounts' local group, as nova-nix finds it,
+# or $null on a machine with no such group.
+function Get-BuildersSid {
+    Import-EntryNative
+    $bytes = [NovaNix.Entry]::LocalGroupSid($NovaNixBuildersGroup)
+    if ($null -eq $bytes) {
+        return $null
+    }
+    return [System.Security.Principal.SecurityIdentifier]::new($bytes, 0).Value
+}
+
 # The rights that let an account change an entry, generic ones included.
 function Get-WriteRight {
     $specific = [int][System.Security.AccessControl.FileSystemRights]'WriteData, AppendData, WriteExtendedAttributes, DeleteSubdirectoriesAndFiles, WriteAttributes, Delete, ChangePermissions, TakeOwnership'
@@ -714,7 +772,12 @@ function Assert-StoreDirectory([string]$Path) {
 # whoever made it. Read and execute for Users is no change. The DACL is read
 # as Windows keeps it, every allow entry counted, inherit-only and callback
 # entries among them, which a FileSecurity built for a file would drop.
-function Assert-StoreEntry([string]$Path, [psobject]$Entry, [string[]]$Trusted, [int]$Writes) {
+#
+# One grant to another account is trusted, as nova-nix trusts it: on the
+# store directory alone, an entry for the build accounts' group, Builders,
+# where the machine has one, that applies to the directory itself and passes
+# to nothing in it, and grants creating entries there and nothing more.
+function Assert-StoreEntry([string]$Path, [psobject]$Entry, [string[]]$Trusted, [int]$Writes, [string]$Builders) {
     $untrusted = "so the store in $NovaNixStoreRoot cannot be trusted; move $NovaNixStoreRoot aside, then run this again"
     $owner = if ($null -ne $Entry.Descriptor.Owner) { $Entry.Descriptor.Owner.Value } else { 'no one' }
     if ($Trusted -notcontains $owner) {
@@ -733,7 +796,9 @@ function Assert-StoreEntry([string]$Path, [psobject]$Entry, [string[]]$Trusted, 
         } else {
             $allows = $ace.AceType -eq [System.Security.AccessControl.AceType]::AccessAllowedCompound
         }
-        if ($allows -and ($ace.AccessMask -band $Writes) -and $Trusted -notcontains $ace.SecurityIdentifier.Value) {
+        $creates = $Builders -and $Path -eq $NovaNixStore -and $ace.SecurityIdentifier.Value -eq $Builders -and
+            ($ace.AccessMask -band -bnot $NovaNixBuildersCreate) -eq 0 -and ([int]$ace.AceFlags -band $NovaNixPassingDown) -eq 0
+        if ($allows -and ($ace.AccessMask -band $Writes) -and $Trusted -notcontains $ace.SecurityIdentifier.Value -and -not $creates) {
             throw "$Path lets $($ace.SecurityIdentifier.Value) change it, $untrusted"
         }
     }
@@ -743,13 +808,14 @@ function Assert-StoreEntry([string]$Path, [psobject]$Entry, [string[]]$Trusted, 
 function Assert-StoreTree {
     $trusted = Get-TrustedSid
     $writes = Get-WriteRight
-    Assert-StoreEntry -Path $NovaNixStoreRoot -Entry (Read-EntrySecurity $NovaNixStoreRoot) -Trusted $trusted -Writes $writes
+    $builders = Get-BuildersSid
+    Assert-StoreEntry -Path $NovaNixStoreRoot -Entry (Read-EntrySecurity $NovaNixStoreRoot) -Trusted $trusted -Writes $writes -Builders $builders
     $pending = [System.Collections.Generic.Stack[string]]::new()
     $pending.Push($NovaNixStoreRoot)
     while ($pending.Count -gt 0) {
         foreach ($path in [System.IO.Directory]::GetFileSystemEntries($pending.Pop())) {
             $entry = Read-EntrySecurity $path
-            Assert-StoreEntry -Path $path -Entry $entry -Trusted $trusted -Writes $writes
+            Assert-StoreEntry -Path $path -Entry $entry -Trusted $trusted -Writes $writes -Builders $builders
             if (($entry.Attributes -band $FileAttributeDirectory) -and -not ($entry.Attributes -band $FileAttributeReparsePoint)) {
                 $pending.Push($path)
             }

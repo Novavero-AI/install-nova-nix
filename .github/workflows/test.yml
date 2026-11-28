@@ -1220,6 +1220,44 @@ jobs:
           icacls 'C:\nix\store' /remove:g '*S-1-5-32-545' | Out-Null
           & $installer -From $env:RELEASE_DIR
 
+      # nova-nix lets its build accounts' local group, nixbld, create entries
+      # in the store directory and do nothing else there, by an entry that
+      # applies to that directory alone: install accepts it.  The same entry
+      # passed down would let the group change what the store holds, and is
+      # refused on every run, with the store left as it was.
+      - name: The build accounts' create-only grant on the store directory is accepted, and refused passed down
+        run: |
+          $installer = [scriptblock]::Create((Get-Content -Raw -LiteralPath install.ps1))
+          # FILE_ADD_FILE, FILE_ADD_SUBDIRECTORY, FILE_TRAVERSE,
+          # FILE_READ_ATTRIBUTES and SYNCHRONIZE, as nova-nix grants them.
+          $create = '(WD,AD,X,RA,S)'
+          net localgroup nixbld /add | Out-Null
+          if ($LASTEXITCODE -ne 0) { throw 'could not create the nixbld group' }
+          $sid = $null
+          try {
+            $sid = ([System.Security.Principal.NTAccount]::new($env:COMPUTERNAME, 'nixbld')).Translate([System.Security.Principal.SecurityIdentifier]).Value
+            icacls 'C:\nix\store' /grant "*${sid}:$create" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'could not grant the create-only entry' }
+            & $installer -From $env:RELEASE_DIR
+            icacls 'C:\nix\store'
+            icacls 'C:\nix\store' /remove:g "*$sid" | Out-Null
+            icacls 'C:\nix\store' /grant "*${sid}:(OI)(CI)$create" | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw 'could not grant the entry passed down' }
+            $before = (icacls 'C:\nix\store') -join "`n"
+            foreach ($arguments in @(@{ From = $env:RELEASE_DIR }, @{ From = $env:RELEASE_DIR }, @{ Uninstall = $true; RemoveStore = $true })) {
+              $refusal = $null
+              try { & $installer @arguments } catch { $refusal = $_.Exception.Message }
+              if ($null -eq $refusal) { throw "went ahead with $($arguments.Keys -join ', ') over nixbld's create-only entry passed down" }
+              Write-Host "refused: $refusal"
+              if ($refusal -notlike "*C:\nix\store lets $sid change it*") { throw "refused for another reason: $refusal" }
+            }
+            if (((icacls 'C:\nix\store') -join "`n") -ne $before) { throw "C:\nix\store's DACL changed before refusing" }
+          } finally {
+            if ($sid) { icacls 'C:\nix\store' /remove:g "*$sid" | Out-Null }
+            net localgroup nixbld /delete | Out-Null
+          }
+          & $installer -From $env:RELEASE_DIR
+
       # Another account named in C:\nix's DACL is that account's store, which
       # neither install nor uninstall takes: a local account, and an Entra ID
       # account, whose SID is not a local account's.
