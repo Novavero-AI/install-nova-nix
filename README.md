@@ -37,7 +37,9 @@ $ nova-nix eval --expr '1 + 2'
 nova-nix is installed in `~/.nova-nix`, or `%LOCALAPPDATA%\Programs\nova-nix`
 on Windows. Its `bin/` goes on `PATH` through `~/.profile`, the bash startup
 files you have, `~/.zshenv` when zsh is installed and fish's `conf.d` when fish
-is, or through your user `Path` on Windows.
+is, or through your user `Path` on Windows. Ahead of it goes `~/.nix-profile/bin`,
+or `%USERPROFILE%\.nix-profile\bin` on Windows, where nova-nix's default profile
+keeps the programs of the packages added to it, so they come first on `PATH`.
 
 ### The store
 
@@ -109,9 +111,11 @@ steps:
   - run: nova-nix eval --expr '1 + 2'
 ```
 
-The action sets up [the store](#the-store) as the installer does on a machine,
-with the same checks, so a command needs `--store` only where upstream Nix
-manages `/nix/store`. On Linux and macOS that needs `sudo` without a password,
+The action puts nova-nix's `bin/` on `PATH`, with the default profile's
+`.nix-profile/bin` in the home ahead of it, as the installer does. It sets up
+[the store](#the-store) as the installer does on a machine, with the same
+checks, so a command needs `--store` only where upstream Nix manages
+`/nix/store`. On Linux and macOS that needs `sudo` without a password,
 as GitHub's hosted runners have, unless `/nix` is already yours.
 
 ### Inputs
@@ -180,7 +184,8 @@ jobs:
 A composite action: the steps run directly in your job, on your runner, with no
 Node bundle to build or audit. It resolves the platform, downloads the matching
 archive and the release's `SHA256SUMS`, verifies the archive against it,
-unpacks it under `RUNNER_TEMP`, and appends `bin/` to `GITHUB_PATH`. Then it
+unpacks it under `RUNNER_TEMP`, and appends `bin/` to `GITHUB_PATH`, then the
+profile's `bin/`, which a later line puts ahead on `PATH`. Then it
 sets up the store with the installer at the same ref, `install.sh --store-only`,
 or `install.ps1 -StoreOnly` on Windows.
 

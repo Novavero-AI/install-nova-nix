@@ -7,7 +7,8 @@
 # Arguments go after `sh -s --`; --help lists them. The script downloads a
 # release archive and the release's SHA256SUMS, refuses an archive that does
 # not match, sets up /nix for the store, unpacks the archive into
-# ~/.nova-nix and adds its bin/ to PATH in the shell startup files.
+# ~/.nova-nix and adds its bin/ to PATH in the shell startup files, with the
+# bin/ of nova-nix's default profile, ~/.nix-profile, ahead of it.
 #
 # Nothing happens until main, on the last line, so a download cut short does
 # nothing.
@@ -28,15 +29,27 @@ download_retries=3
 usage_status=2
 root_uid=0
 
-# The line added to each shell startup file. It expands HOME when the shell
-# starts and adds bin/ only once, so a file read twice leaves PATH as it was.
+# The line added to each shell startup file for a directory under HOME. It
+# expands HOME when the shell starts and adds the directory only once, so a
+# file read twice leaves PATH as it was.
 # shellcheck disable=SC2016 # The variables expand in the startup file, not here.
-bin_ref='${HOME}/'"${install_dir}"'/bin'
-# shellcheck disable=SC2016
-path_line=$(printf 'case ":${PATH}:" in *":%s:"*) ;; *) export PATH="%s:${PATH}" ;; esac # added by the nova-nix installer' "${bin_ref}" "${bin_ref}")
+path_line_for() {
+  printf 'case ":${PATH}:" in *":${HOME}/%s:"*) ;; *) export PATH="${HOME}/%s:${PATH}" ;; esac # added by the nova-nix installer' "$1" "$1"
+}
 # fish reads none of the files above; it reads every file in its conf.d.
 # shellcheck disable=SC2016
-fish_line='if not contains -- "$HOME/'"${install_dir}"'/bin" $PATH; set -gx PATH "$HOME/'"${install_dir}"'/bin" $PATH; end # added by the nova-nix installer'
+fish_line_for() {
+  printf 'if not contains -- "$HOME/%s" $PATH; set -gx PATH "$HOME/%s" $PATH; end # added by the nova-nix installer' "$1" "$1"
+}
+path_line=$(path_line_for "${install_dir}/bin")
+fish_line=$(fish_line_for "${install_dir}/bin")
+# The profile nova-nix keeps for this user links the programs of the packages
+# added to it from its bin/. Its line comes after nova-nix's, so the profile
+# goes ahead of everything on PATH, nova-nix's own bin/ included, as upstream
+# Nix's profile script puts it.
+profile_bin=.nix-profile/bin
+profile_path_line=$(path_line_for "${profile_bin}")
+profile_fish_line=$(fish_line_for "${profile_bin}")
 
 # macOS: the volume that holds /nix, how fstab mounts it, and the
 # LaunchDaemon that mounts it at boot. The volume is case-sensitive, so
@@ -389,7 +402,8 @@ fish_conf() { printf '%s\n' "$(fish_conf_dir)/nova-nix.fish"; }
 # HOME otherwise, and a ZDOTDIR exported from ~/.zshenv is set only after the
 # first shell has read that file, so both get the line when they differ.
 # ~/.profile is created if missing, and the zsh and fish files when that
-# shell is installed.
+# shell is installed. Each file gets nova-nix's line and then the profile's,
+# so a new shell puts the profile's bin/ first.
 add_path_lines() {
   set -- "${HOME}/.profile"
   for name in .bash_profile .bash_login .bashrc; do
@@ -400,12 +414,14 @@ add_path_lines() {
     if [ "$(zsh_env)" != "${HOME}/.zshenv" ]; then set -- "$@" "$(zsh_env)"; fi
   fi
   for rc in "$@"; do
-    add_path_line "${rc}" "${path_line}"
+    add_path_line "${rc}" "${path_line}" "${root}/bin" nova-nix
+    add_path_line "${rc}" "${profile_path_line}" "${HOME}/${profile_bin}" "nova-nix's profile"
   done
   covered='sh bash dash ksh zsh'
   if command -v fish >/dev/null 2>&1; then
     mkdir -p "$(fish_conf_dir)" || die "could not create $(fish_conf_dir)"
-    add_path_line "$(fish_conf)" "${fish_line}"
+    add_path_line "$(fish_conf)" "${fish_line}" "${root}/bin" nova-nix
+    add_path_line "$(fish_conf)" "${profile_fish_line}" "${HOME}/${profile_bin}" "nova-nix's profile"
     covered="${covered} fish"
   fi
   shell_name=${SHELL:-}
@@ -413,45 +429,49 @@ add_path_lines() {
   if [ -n "${shell_name}" ]; then
     case " ${covered} " in
       *" ${shell_name} "*) ;;
-      *) say "Your shell, ${shell_name}, reads none of those files: add ${root}/bin to its PATH" ;;
+      *) say "Your shell, ${shell_name}, reads none of those files: add ${HOME}/${profile_bin} and then ${root}/bin to the front of its PATH" ;;
     esac
   fi
 }
 
+# Adds line $2 to file $1 unless it is there, the line that puts directory
+# $3, which $4 names, on PATH.
 add_path_line() {
   if [ -f "$1" ] && grep -qxF -e "$2" "$1"; then
     return 0
   fi
   if [ -e "$1" ] && [ ! -w "$1" ]; then
-    warn "cannot write to $1; add ${root}/bin to PATH there yourself"
+    warn "cannot write to $1; add $3 to PATH there yourself"
     return 0
   fi
   if [ -s "$1" ] && [ -n "$(tail -c 1 "$1")" ]; then
     printf '\n' >>"$1" || die "could not write to $1"
   fi
   printf '%s\n' "$2" >>"$1" || die "could not write to $1"
-  say "Added nova-nix to PATH in $1"
+  say "Added $4 to PATH in $1"
 }
 
-# Removes the line wherever it is, whatever made it worth adding there, and
-# the fish file, which holds nothing else.
+# Removes both lines wherever they are, whatever made them worth adding
+# there, and the fish file, which holds nothing else.
 remove_path_lines() {
   for rc in "${HOME}/.profile" "${HOME}/.bash_profile" "${HOME}/.bash_login" \
     "${HOME}/.bashrc" "${HOME}/.zshenv" "$(zsh_env)"; do
-    remove_line "${rc}" "${path_line}"
+    remove_line "${rc}" "${path_line}" nova-nix
+    remove_line "${rc}" "${profile_path_line}" "nova-nix's profile"
   done
   fish=$(fish_conf)
-  remove_line "${fish}" "${fish_line}"
+  remove_line "${fish}" "${fish_line}" nova-nix
+  remove_line "${fish}" "${profile_fish_line}" "nova-nix's profile"
   if [ -f "${fish}" ] && [ ! -s "${fish}" ]; then
     rm "${fish}" || warn "could not remove the empty ${fish}"
   fi
 }
 
-# Removes every line equal to $2 from file $1, rewriting it in place so a
-# symbolic link stays a link and the file keeps its owner and mode. The
-# lines kept are written beside it first, outside the scratch directory, so
-# that a rewrite cut short leaves them there to be named. A file it cannot
-# write is named and left as it is.
+# Removes every line equal to $2, the line that puts what $3 names on PATH,
+# from file $1, rewriting it in place so a symbolic link stays a link and the
+# file keeps its owner and mode. The lines kept are written beside it first,
+# outside the scratch directory, so that a rewrite cut short leaves them
+# there to be named. A file it cannot write is named and left as it is.
 remove_line() {
   if ! { [ -f "$1" ] && grep -qxF -e "$2" "$1"; }; then
     return 0
@@ -464,7 +484,7 @@ remove_line() {
   grep -vxF -e "$2" "$1" >"${kept}" || [ "$?" -eq 1 ] || die "could not read $1"
   cat "${kept}" >"$1" || die "could not rewrite $1; its other lines are in ${kept}"
   rm -f "${kept}"
-  say "Removed nova-nix from PATH in $1"
+  say "Removed $3 from PATH in $1"
 }
 
 # ---------------------------------------------------------------------------
@@ -1124,7 +1144,7 @@ install_nova_nix() {
   place
   add_path_lines
   say "${reported} is installed in ${root}."
-  say "Open a new shell to use it, or run: export PATH=\"${root}/bin:\${PATH}\""
+  say "Open a new shell to use it, or run: export PATH=\"${HOME}/${profile_bin}:${root}/bin:\${PATH}\""
 }
 
 # Everything that can refuse runs before anything is removed, so a refusal

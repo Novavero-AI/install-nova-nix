@@ -1,5 +1,5 @@
 name: Install nova-nix
-description: Install a released nova-nix, put it on PATH and set up its store. No toolchain required.
+description: Install a released nova-nix, put it and its profile on PATH and set up its store. No toolchain required.
 author: Novavero AI Inc.
 
 branding:
@@ -159,6 +159,17 @@ runs:
         fi
 
         echo "${root}/bin" >> "${GITHUB_PATH}"
+        # The profile nova-nix keeps for this user links the programs of the
+        # packages added to it from .nix-profile/bin in the home, which is
+        # USERPROFILE on Windows.  A later line of GITHUB_PATH comes earlier
+        # on PATH, so this one goes ahead of nova-nix's bin/, as the
+        # installers put it.
+        if [ "${platform}" = windows ]; then
+          profile_home=${USERPROFILE}
+        else
+          profile_home=${HOME}
+        fi
+        echo "${profile_home}/.nix-profile/bin" >> "${GITHUB_PATH}"
         echo "bin-dir=${root}/bin" >> "${GITHUB_OUTPUT}"
         echo "archive=${archive}" >> "${GITHUB_OUTPUT}"
 
